@@ -1,0 +1,255 @@
+import { FastifyInstance, FastifyPluginCallback } from 'fastify';
+import { eq, and, lt } from 'drizzle-orm';
+import {
+  users,
+  desktopSessions,
+  pendingEntitlements,
+  migrationClaims,
+  referralCodes,
+  referralEvents,
+  userMacros,
+} from '../db/schema.js';
+import { verifyOAuthProof, generateSessionToken } from '../lib/crypto.js';
+import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
+
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const MOTIONCORD_DESKTOP_SECRET = process.env.MOTIONCORD_DESKTOP_SECRET ?? '';
+
+const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) => {
+  // ── POST /auth/oauth ────────────────────────────────────────────────────────
+  app.post<{
+    Body: {
+      discordId: string;
+      username: string;
+      avatar?: string;
+      hwid: string;
+      oauthProof: string;
+      issuedAt: number;
+      referralCode?: string;
+    };
+  }>('/auth/oauth', async (request, reply) => {
+    const { discordId, username, avatar, hwid, oauthProof, issuedAt, referralCode } = request.body;
+    const { db } = request.server;
+
+    // ── 1. Verify OAuth proof or admin secret ──────────────────────────────────
+    const adminSecret = request.headers['x-admin-secret'];
+    const isAdminBypass = typeof adminSecret === 'string'
+      && process.env.ADMIN_SECRET
+      && adminSecret === process.env.ADMIN_SECRET;
+
+    if (!isAdminBypass) {
+      if (!verifyOAuthProof(discordId, issuedAt, oauthProof, MOTIONCORD_DESKTOP_SECRET)) {
+        return reply.code(401).send({ error: 'Invalid OAuth proof' });
+      }
+    }
+
+    // ── 2. Find or create user ─────────────────────────────────────────────────
+    let user = await db.select().from(users).where(eq(users.discordId, discordId)).then((rows: any[]) => rows[0] ?? null);
+
+    const isNewUser = user === null;
+
+    if (isNewUser) {
+      const inserted = await db.insert(users).values({
+        discordId,
+        username,
+        avatar: avatar ?? null,
+        hwid,
+      }).returning();
+      user = inserted[0];
+    } else {
+      // Update username/avatar on each login
+      await db.update(users).set({
+        username,
+        avatar: avatar ?? user.avatar,
+      }).where(eq(users.discordId, discordId));
+      user = { ...user, username, avatar: avatar ?? user.avatar };
+    }
+
+    // ── 3. HWID binding logic ──────────────────────────────────────────────────
+    if (!isNewUser) {
+      const storedHwid = user.hwid;
+
+      if (storedHwid && storedHwid !== hwid) {
+        // Auto-migrate legacy 32-char SHA256 hashes
+        if (storedHwid.length === 32) {
+          await db.update(users).set({ hwid }).where(eq(users.discordId, discordId));
+          user = { ...user, hwid };
+        } else if (user.hwidResetAllowed) {
+          await db.update(users).set({ hwid, hwidResetAllowed: false }).where(eq(users.discordId, discordId));
+          user = { ...user, hwid, hwidResetAllowed: false };
+        } else {
+          return reply.code(403).send({ error: 'HWID_MISMATCH' });
+        }
+      } else if (!storedHwid) {
+        await db.update(users).set({ hwid }).where(eq(users.discordId, discordId));
+        user = { ...user, hwid };
+      }
+    }
+
+    // ── 4. Merge pending entitlements ───────────────────────────────────────────
+    const entitlements = await db.select().from(pendingEntitlements)
+      .where(eq(pendingEntitlements.discordId, discordId));
+
+    for (const ent of entitlements) {
+      await db.insert(userMacros).values({
+        discordId,
+        macro: ent.macro,
+        source: ent.source,
+        duration: ent.duration,
+      }).onConflictDoNothing();
+      await db.delete(pendingEntitlements).where(eq(pendingEntitlements.id, ent.id));
+    }
+
+    // ── 5. Merge migration claims ───────────────────────────────────────────────
+    const claims = await db.select().from(migrationClaims)
+      .where(and(
+        eq(migrationClaims.discordId, discordId),
+        eq(migrationClaims.status, 'pending'),
+      ));
+
+    for (const claim of claims) {
+      await db.insert(userMacros).values({
+        discordId,
+        macro: claim.macro,
+        source: 'migration',
+        duration: claim.duration,
+      }).onConflictDoNothing();
+      await db.update(migrationClaims).set({ status: 'resolved' })
+        .where(eq(migrationClaims.id, claim.id));
+    }
+
+    // ── 6. Referral code (new users only) ──────────────────────────────────────
+    if (isNewUser && referralCode) {
+      const ref = await db.select().from(referralCodes)
+        .where(eq(referralCodes.code, referralCode))
+        .then((rows: any[]) => rows[0] ?? null);
+
+      if (ref) {
+        await db.update(users).set({ referredByDiscordId: ref.discordId })
+          .where(eq(users.discordId, discordId));
+        user = { ...user, referredByDiscordId: ref.discordId };
+
+        await db.insert(referralEvents).values({
+          referrerDiscordId: ref.discordId,
+          referredDiscordId: discordId,
+          eventType: 'install',
+        });
+      }
+    }
+
+    // ── 7. Invalidate existing sessions ─────────────────────────────────────────
+    await db.delete(desktopSessions)
+      .where(eq(desktopSessions.discordId, discordId));
+
+    // ── 8. Create new session ──────────────────────────────────────────────────
+    const sessionToken = generateSessionToken();
+    const expiresAt = new Date(Date.now() + THIRTY_DAYS_MS);
+
+    await db.insert(desktopSessions).values({
+      discordId,
+      token: sessionToken,
+      hwid,
+      expiresAt,
+    });
+
+    return reply.send({
+      user: {
+        discordId: user.discordId,
+        username: user.username,
+        avatar: user.avatar,
+        hwid: user.hwid,
+        referredByDiscordId: user.referredByDiscordId ?? null,
+      },
+      sessionToken,
+      expiresAt: expiresAt.toISOString(),
+    });
+  });
+
+  // ── POST /auth/session ──────────────────────────────────────────────────────
+  app.post('/auth/session', { preHandler: [desktopSessionAuth] }, async (request, reply) => {
+    const { discordId } = (request as AuthenticatedRequest).session;
+    const { db } = request.server;
+
+    const user = await db.select().from(users)
+      .where(eq(users.discordId, discordId))
+      .then((rows: any[]) => rows[0] ?? null);
+
+    if (!user) {
+      return reply.code(404).send({ error: 'User not found' });
+    }
+
+    const macros = await db.select().from(userMacros)
+      .where(eq(userMacros.discordId, discordId));
+
+    return reply.send({
+      user: {
+        discordId: user.discordId,
+        username: user.username,
+        avatar: user.avatar,
+        hwid: user.hwid,
+      },
+      macros,
+    });
+  });
+
+  // ── POST /auth/signout ──────────────────────────────────────────────────────
+  app.post('/auth/signout', { preHandler: [desktopSessionAuth] }, async (request, reply) => {
+    const token = request.headers['x-session-token'];
+    const { db } = request.server;
+
+    if (typeof token === 'string') {
+      await db.delete(desktopSessions).where(eq(desktopSessions.token, token));
+    }
+
+    return reply.send({ ok: true });
+  });
+
+  // ── GET /auth/hwid-check ─────────────────────────────────────────────────────
+  app.get<{ Querystring: { hwid?: string } }>('/auth/hwid-check', async (request, reply) => {
+    const hwid = request.query.hwid;
+
+    if (!hwid) {
+      return reply.code(400).send({ error: 'Missing hwid query parameter' });
+    }
+
+    const { db } = request.server;
+
+    const user = await db.select({
+      discordId: users.discordId,
+    }).from(users)
+      .where(eq(users.hwid, hwid))
+      .then((rows: any[]) => rows[0] ?? null);
+
+    if (!user) {
+      return reply.send({ bound: false });
+    }
+
+    return reply.send({ bound: true, discordId: user.discordId });
+  });
+
+  // ── POST /auth/reset-hwid ────────────────────────────────────────────────────
+  app.post<{ Body: { discordId: string } }>('/auth/reset-hwid', { preHandler: [adminAuth] }, async (request, reply) => {
+    const { discordId } = request.body;
+    const { db } = request.server;
+
+    await db.update(users).set({ hwidResetAllowed: true })
+      .where(eq(users.discordId, discordId));
+
+    return reply.send({ ok: true });
+  });
+
+  // ── POST /auth/clear-hwid ────────────────────────────────────────────────────
+  app.post<{ Body: { discordId: string } }>('/auth/clear-hwid', { preHandler: [adminAuth] }, async (request, reply) => {
+    const { discordId } = request.body;
+    const { db } = request.server;
+
+    await db.update(users).set({ hwid: null })
+      .where(eq(users.discordId, discordId));
+
+    return reply.send({ ok: true });
+  });
+
+  done();
+};
+
+export default authPlugin;
