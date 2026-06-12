@@ -120,8 +120,7 @@ const reportPlugin: FastifyPluginCallback = async (fastify) => {
       .from(clientReports)
       .where(sql`${clientReports.createdAt} >= ${cutoff}`)
       .orderBy(desc(clientReports.createdAt))
-      .limit(limit)
-      .execute();
+      .limit(limit);
 
     reply.send(result);
   });

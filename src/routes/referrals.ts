@@ -1,6 +1,8 @@
 import { FastifyPluginCallback } from 'fastify';
+import { eq, and, gte } from 'drizzle-orm';
 import { desktopSessionAuth, AuthenticatedRequest, adminAuth } from '../middleware/auth.js';
 import { generateReferralCode } from '../lib/crypto.js';
+import { referralCodes, referralEvents, userMacros } from '../db/schema.js';
 
 const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
   // ── GET /referrals/my-info ───────────────────────────────────────────────
@@ -9,31 +11,32 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const { db } = request.server;
 
     // Look up or create referral code
-    let referralCode = await db
-      .selectFrom('referralCodes')
-      .select(['code'])
-      .where('discordId', '=', discordId)
-      .executeTakeFirst();
+    const [referralCode] = await db
+      .select({ code: referralCodes.code })
+      .from(referralCodes)
+      .where(eq(referralCodes.discordId, discordId))
+      .limit(1);
 
     if (!referralCode) {
       const code = generateReferralCode(discordId);
       await db
-        .insertInto('referralCodes')
-        .values({ discordId, code })
-        .execute();
-      referralCode = { code };
+        .insert(referralCodes)
+        .values({ discordId, code });
     }
+
+    const codeResult = referralCode ?? { code: generateReferralCode(discordId) };
 
     // Count install referral events (last 30 days, max 10/month for reward)
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
     const installEvents = await db
-      .selectFrom('referralEvents')
-      .select(['referredDiscordId'])
-      .where('referrerDiscordId', '=', discordId)
-      .where('eventType', '=', 'install')
-      .where('createdAt', '>=', thirtyDaysAgo)
-      .execute();
+      .select({ referredDiscordId: referralEvents.referredDiscordId })
+      .from(referralEvents)
+      .where(and(
+        eq(referralEvents.referrerDiscordId, discordId),
+        eq(referralEvents.eventType, 'install'),
+        gte(referralEvents.createdAt, thirtyDaysAgo),
+      ));
 
     // Deduplicate by referredDiscordId for install count
     const uniqueReferred = new Set(installEvents.map((e) => e.referredDiscordId));
@@ -41,21 +44,23 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // Count purchase referral events
     const purchaseEvents = await db
-      .selectFrom('referralEvents')
-      .select(['id'])
-      .where('referrerDiscordId', '=', discordId)
-      .where('eventType', '=', 'purchase')
-      .execute();
+      .select({ id: referralEvents.id })
+      .from(referralEvents)
+      .where(and(
+        eq(referralEvents.referrerDiscordId, discordId),
+        eq(referralEvents.eventType, 'purchase'),
+      ));
 
     const purchaseCount = purchaseEvents.length;
 
     // Get referrer's active macros count
     const activeMacros = await db
-      .selectFrom('userMacros')
-      .select(['macro'])
-      .where('discordId', '=', discordId)
-      .where('status', '=', 'active')
-      .execute();
+      .select({ macro: userMacros.macro })
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, discordId),
+        eq(userMacros.status, 'active'),
+      ));
 
     const activeMacroCount = activeMacros.length;
 
@@ -66,11 +71,12 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // Add purchase rewards based on duration
     const purchaseDetails = await db
-      .selectFrom('referralEvents')
-      .select(['duration'])
-      .where('referrerDiscordId', '=', discordId)
-      .where('eventType', '=', 'purchase')
-      .execute();
+      .select({ duration: referralEvents.duration })
+      .from(referralEvents)
+      .where(and(
+        eq(referralEvents.referrerDiscordId, discordId),
+        eq(referralEvents.eventType, 'purchase'),
+      ));
 
     for (const purchase of purchaseDetails) {
       const duration = purchase.duration;
@@ -86,7 +92,7 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     return reply.send({
-      code: referralCode.code,
+      code: codeResult.code,
       installCount,
       purchaseCount,
       rewardDays,
@@ -98,19 +104,18 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const { discordId } = (request as AuthenticatedRequest).session;
     const { db } = request.server;
 
-    let referralCode = await db
-      .selectFrom('referralCodes')
-      .select(['code'])
-      .where('discordId', '=', discordId)
-      .executeTakeFirst();
+    const [referralCode] = await db
+      .select({ code: referralCodes.code })
+      .from(referralCodes)
+      .where(eq(referralCodes.discordId, discordId))
+      .limit(1);
 
     if (!referralCode) {
       const code = generateReferralCode(discordId);
       await db
-        .insertInto('referralCodes')
-        .values({ discordId, code })
-        .execute();
-      referralCode = { code };
+        .insert(referralCodes)
+        .values({ discordId, code });
+      return reply.send({ code });
     }
 
     return reply.send({ code: referralCode.code });
@@ -128,13 +133,15 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const { referrerDiscordId, referredDiscordId } = body;
 
     // Dedup: check if this install referral already exists
-    const existing = await db
-      .selectFrom('referralEvents')
-      .select(['id'])
-      .where('referrerDiscordId', '=', referrerDiscordId)
-      .where('referredDiscordId', '=', referredDiscordId)
-      .where('eventType', '=', 'install')
-      .executeTakeFirst();
+    const [existing] = await db
+      .select({ id: referralEvents.id })
+      .from(referralEvents)
+      .where(and(
+        eq(referralEvents.referrerDiscordId, referrerDiscordId),
+        eq(referralEvents.referredDiscordId, referredDiscordId),
+        eq(referralEvents.eventType, 'install'),
+      ))
+      .limit(1);
 
     if (existing) {
       return reply.code(409).send({ error: 'Install referral already recorded.' });
@@ -144,12 +151,13 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
     const monthInstalls = await db
-      .selectFrom('referralEvents')
-      .select(['referredDiscordId'])
-      .where('referrerDiscordId', '=', referrerDiscordId)
-      .where('eventType', '=', 'install')
-      .where('createdAt', '>=', thirtyDaysAgo)
-      .execute();
+      .select({ referredDiscordId: referralEvents.referredDiscordId })
+      .from(referralEvents)
+      .where(and(
+        eq(referralEvents.referrerDiscordId, referrerDiscordId),
+        eq(referralEvents.eventType, 'install'),
+        gte(referralEvents.createdAt, thirtyDaysAgo),
+      ));
 
     const uniqueMonthInstalls = new Set(monthInstalls.map((e) => e.referredDiscordId));
     if (uniqueMonthInstalls.size >= 10) {
@@ -158,11 +166,16 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // Get referrer's active macros
     const activeMacros = await db
-      .selectFrom('userMacros')
-      .select(['macro', 'id', 'expiresAt'])
-      .where('discordId', '=', referrerDiscordId)
-      .where('status', '=', 'active')
-      .execute();
+      .select({
+        macro: userMacros.macro,
+        id: userMacros.id,
+        expiresAt: userMacros.expiresAt,
+      })
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, referrerDiscordId),
+        eq(userMacros.status, 'active'),
+      ));
 
     // For each active macro, add 3 days
     const daysPerMacro = 3;
@@ -172,24 +185,22 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
       if (macro.expiresAt) {
         const newExpiry = new Date(macro.expiresAt.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
         await db
-          .updateTable('userMacros')
+          .update(userMacros)
           .set({ expiresAt: newExpiry, updatedAt: new Date() })
-          .where('id', '=', macro.id)
-          .execute();
+          .where(eq(userMacros.id, macro.id));
       }
       daysAwarded += daysPerMacro;
     }
 
     // Create referralEvent
     await db
-      .insertInto('referralEvents')
+      .insert(referralEvents)
       .values({
         referrerDiscordId,
         referredDiscordId,
         eventType: 'install',
         daysAwarded,
-      })
-      .execute();
+      });
 
     return reply.send({ ok: true, daysAwarded });
   });
@@ -212,11 +223,11 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const { referrerDiscordId, referredDiscordId, orderId, macro, duration } = body;
 
     // Dedup by orderId
-    const existing = await db
-      .selectFrom('referralEvents')
-      .select(['id'])
-      .where('orderId', '=', orderId)
-      .executeTakeFirst();
+    const [existing] = await db
+      .select({ id: referralEvents.id })
+      .from(referralEvents)
+      .where(eq(referralEvents.orderId, orderId))
+      .limit(1);
 
     if (existing) {
       return reply.code(409).send({ error: 'Purchase referral already recorded for this order.' });
@@ -236,11 +247,16 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // Get referrer's active macros
     const activeMacros = await db
-      .selectFrom('userMacros')
-      .select(['macro', 'id', 'expiresAt'])
-      .where('discordId', '=', referrerDiscordId)
-      .where('status', '=', 'active')
-      .execute();
+      .select({
+        macro: userMacros.macro,
+        id: userMacros.id,
+        expiresAt: userMacros.expiresAt,
+      })
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, referrerDiscordId),
+        eq(userMacros.status, 'active'),
+      ));
 
     let daysAwarded = 0;
 
@@ -248,17 +264,16 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
       if (activeMacro.expiresAt) {
         const newExpiry = new Date(activeMacro.expiresAt.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
         await db
-          .updateTable('userMacros')
+          .update(userMacros)
           .set({ expiresAt: newExpiry, updatedAt: new Date() })
-          .where('id', '=', activeMacro.id)
-          .execute();
+          .where(eq(userMacros.id, activeMacro.id));
       }
       daysAwarded += daysPerMacro;
     }
 
     // Create referralEvent
     await db
-      .insertInto('referralEvents')
+      .insert(referralEvents)
       .values({
         referrerDiscordId,
         referredDiscordId,
@@ -267,8 +282,7 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
         macroName: macro,
         duration,
         daysAwarded,
-      })
-      .execute();
+      });
 
     return reply.send({ ok: true, daysAwarded });
   });

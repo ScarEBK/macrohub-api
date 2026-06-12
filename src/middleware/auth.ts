@@ -1,5 +1,7 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
+import { eq } from 'drizzle-orm';
 import { timingSafeEqual } from '../lib/crypto.js';
+import { desktopSessions, users } from '../db/schema.js';
 
 export interface AuthenticatedRequest extends FastifyRequest {
   session: {
@@ -44,11 +46,15 @@ export async function desktopSessionAuth(request: FastifyRequest, reply: Fastify
 
   const { db } = request.server;
 
-  const session = await db
-    .selectFrom('desktopSessions')
-    .select(['discordId', 'hwid', 'expiresAt', 'hwidResetAllowed'])
-    .where('token', '=', token)
-    .executeTakeFirst();
+  const [session] = await db
+    .select({
+      discordId: desktopSessions.discordId,
+      hwid: desktopSessions.hwid,
+      expiresAt: desktopSessions.expiresAt,
+    })
+    .from(desktopSessions)
+    .where(eq(desktopSessions.token, token))
+    .limit(1);
 
   if (!session) {
     reply.code(401).send({ error: 'Invalid session token' });
@@ -61,12 +67,18 @@ export async function desktopSessionAuth(request: FastifyRequest, reply: Fastify
   }
 
   if (session.hwid !== hwid) {
-    if (session.hwidResetAllowed) {
+    // Check if the user has hwidResetAllowed
+    const [user] = await db
+      .select({ hwidResetAllowed: users.hwidResetAllowed })
+      .from(users)
+      .where(eq(users.discordId, session.discordId))
+      .limit(1);
+
+    if (user?.hwidResetAllowed) {
       await db
-        .updateTable('desktopSessions')
+        .update(desktopSessions)
         .set({ hwid })
-        .where('token', '=', token)
-        .execute();
+        .where(eq(desktopSessions.token, token));
     } else {
       reply.code(401).send({ error: 'HWID mismatch' });
       return;
@@ -75,6 +87,6 @@ export async function desktopSessionAuth(request: FastifyRequest, reply: Fastify
 
   (request as AuthenticatedRequest).session = {
     discordId: session.discordId,
-    hwid: session.hwidResetAllowed && session.hwid !== hwid ? hwid : session.hwid,
+    hwid,
   };
 }

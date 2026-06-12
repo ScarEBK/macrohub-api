@@ -251,8 +251,7 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
           const createdKeys = await db
             .select()
             .from(licenseKeys)
-            .where(eq(licenseKeys.sellauthOrderId, orderId))
-            .execute();
+            .where(eq(licenseKeys.sellauthOrderId, orderId));
 
           for (const lk of createdKeys) {
             const expiresAt = calculateExpiry(lk.duration);
@@ -300,8 +299,7 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
       const createdKeys = await db
         .select()
         .from(licenseKeys)
-        .where(eq(licenseKeys.sellauthOrderId, orderId))
-        .execute();
+        .where(eq(licenseKeys.sellauthOrderId, orderId));
 
       reply.code(200).send(createdKeys.map((k: any) => k.key).join('\n'));
       return;

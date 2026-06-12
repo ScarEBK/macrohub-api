@@ -1,5 +1,7 @@
 import { FastifyPluginCallback } from 'fastify';
+import { eq, and, ne } from 'drizzle-orm';
 import { desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
+import { userMacros, trialRegistrations } from '../db/schema.js';
 
 const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
   // ── GET /trials/offer ────────────────────────────────────────────────────
@@ -9,12 +11,13 @@ const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // 1. User must have at least 1 paid (non-trial) active macro
     const paidMacros = await db
-      .selectFrom('userMacros')
-      .select(['macro'])
-      .where('discordId', '=', discordId)
-      .where('status', '=', 'active')
-      .where('source', '!=', 'trial')
-      .execute();
+      .select({ macro: userMacros.macro })
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, discordId),
+        eq(userMacros.status, 'active'),
+        ne(userMacros.source, 'trial'),
+      ));
 
     if (paidMacros.length === 0) {
       return reply.send({
@@ -25,11 +28,11 @@ const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     // 2. User's HWID must not have any trialRegistrations
-    const existingTrialReg = await db
-      .selectFrom('trialRegistrations')
-      .select(['id'])
-      .where('hwid', '=', hwid)
-      .executeTakeFirst();
+    const [existingTrialReg] = await db
+      .select({ id: trialRegistrations.id })
+      .from(trialRegistrations)
+      .where(eq(trialRegistrations.hwid, hwid))
+      .limit(1);
 
     if (existingTrialReg) {
       return reply.send({
@@ -41,11 +44,12 @@ const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // 3. Can only trial macros they don't already have active access to
     const activeMacros = await db
-      .selectFrom('userMacros')
-      .select(['macro'])
-      .where('discordId', '=', discordId)
-      .where('status', '=', 'active')
-      .execute();
+      .select({ macro: userMacros.macro })
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, discordId),
+        eq(userMacros.status, 'active'),
+      ));
 
     const activeMacroNames = new Set(activeMacros.map((m) => m.macro));
     const paidMacroNames = paidMacros.map((m) => m.macro);
@@ -81,36 +85,39 @@ const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // 1. Must have at least 1 paid active macro
     const paidMacros = await db
-      .selectFrom('userMacros')
-      .select(['macro'])
-      .where('discordId', '=', discordId)
-      .where('status', '=', 'active')
-      .where('source', '!=', 'trial')
-      .execute();
+      .select({ macro: userMacros.macro })
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, discordId),
+        eq(userMacros.status, 'active'),
+        ne(userMacros.source, 'trial'),
+      ));
 
     if (paidMacros.length === 0) {
       return reply.code(403).send({ error: 'Not eligible: no active paid macros.' });
     }
 
     // 2. HWID must not have trial registrations
-    const existingTrialReg = await db
-      .selectFrom('trialRegistrations')
-      .select(['id'])
-      .where('hwid', '=', hwid)
-      .executeTakeFirst();
+    const [existingTrialReg] = await db
+      .select({ id: trialRegistrations.id })
+      .from(trialRegistrations)
+      .where(eq(trialRegistrations.hwid, hwid))
+      .limit(1);
 
     if (existingTrialReg) {
       return reply.code(403).send({ error: 'Not eligible: device already used for a trial.' });
     }
 
     // 3. Must not already have active access to this macro
-    const existingAccess = await db
-      .selectFrom('userMacros')
-      .select(['id'])
-      .where('discordId', '=', discordId)
-      .where('macro', '=', macro)
-      .where('status', '=', 'active')
-      .executeTakeFirst();
+    const [existingAccess] = await db
+      .select({ id: userMacros.id })
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, discordId),
+        eq(userMacros.macro, macro),
+        eq(userMacros.status, 'active'),
+      ))
+      .limit(1);
 
     if (existingAccess) {
       return reply.code(403).send({ error: 'Not eligible: you already have active access to this macro.' });
@@ -126,17 +133,16 @@ const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // Create trialRegistration record
     await db
-      .insertInto('trialRegistrations')
+      .insert(trialRegistrations)
       .values({
         discordId,
         hwid,
         macro,
-      })
-      .execute();
+      });
 
     // Create userMacro with trial source
     await db
-      .insertInto('userMacros')
+      .insert(userMacros)
       .values({
         discordId,
         macro,
@@ -144,8 +150,7 @@ const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
         source: 'trial',
         duration: '1d',
         expiresAt,
-      })
-      .execute();
+      });
 
     return reply.send({
       success: true,

@@ -1,6 +1,8 @@
 import { FastifyPluginCallback } from 'fastify';
+import { eq, and } from 'drizzle-orm';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { generateLicenseKey, normalizeLicenseKey } from '../lib/crypto.js';
+import { licenseKeys, userMacros, adminLogs, users } from '../db/schema.js';
 
 const VALID_MACROS = ['Speed Boost', 'Glitch Roll', 'Strafe'] as const;
 const VALID_DURATIONS = ['1d', '7d', '1m', 'lifetime'] as const;
@@ -49,7 +51,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       status: 'available',
     }));
 
-    await db.insertInto('licenseKeys').values(values).execute();
+    await db.insert(licenseKeys).values(values);
 
     return reply.send({ keys });
   });
@@ -70,11 +72,11 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     // Try each format to find the key
     let licenseKey: any = null;
     for (const fmt of formats) {
-      const found = await db
-        .selectFrom('licenseKeys')
-        .selectAll()
-        .where('key', '=', fmt)
-        .executeTakeFirst();
+      const [found] = await db
+        .select()
+        .from(licenseKeys)
+        .where(eq(licenseKeys.key, fmt))
+        .limit(1);
       if (found) {
         licenseKey = found;
         break;
@@ -94,11 +96,14 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     // Verify HWID: session's hwid must match the user's hwid (or user has hwidResetAllowed)
-    const user = await db
-      .selectFrom('users')
-      .select(['hwid', 'hwidResetAllowed'])
-      .where('discordId', '=', discordId)
-      .executeTakeFirst();
+    const [user] = await db
+      .select({
+        hwid: users.hwid,
+        hwidResetAllowed: users.hwidResetAllowed,
+      })
+      .from(users)
+      .where(eq(users.discordId, discordId))
+      .limit(1);
 
     if (user && user.hwid && user.hwid !== hwid && !user.hwidResetAllowed) {
       return reply.code(403).send({ error: 'HWID mismatch. Contact support for a reset.' });
@@ -107,14 +112,13 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     // Mark key as redeemed
     const now = new Date();
     await db
-      .updateTable('licenseKeys')
+      .update(licenseKeys)
       .set({
         status: 'redeemed',
         discordId,
         redeemedAt: now,
       })
-      .where('id', '=', licenseKey.id)
-      .execute();
+      .where(eq(licenseKeys.id, licenseKey.id));
 
     // Calculate duration
     const durationMs = DURATION_MS[licenseKey.duration];
@@ -122,12 +126,14 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const duration = licenseKey.duration;
 
     // Upsert userMacro: if active macro exists, extend; otherwise create new
-    const existingMacro = await db
-      .selectFrom('userMacros')
-      .selectAll()
-      .where('discordId', '=', discordId)
-      .where('macro', '=', macro)
-      .executeTakeFirst();
+    const [existingMacro] = await db
+      .select()
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, discordId),
+        eq(userMacros.macro, macro),
+      ))
+      .limit(1);
 
     let expiresAt: Date | null;
 
@@ -143,7 +149,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       }
 
       await db
-        .updateTable('userMacros')
+        .update(userMacros)
         .set({
           status: 'active',
           source: 'redeem',
@@ -151,8 +157,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
           expiresAt,
           updatedAt: now,
         })
-        .where('id', '=', existingMacro.id)
-        .execute();
+        .where(eq(userMacros.id, existingMacro.id));
     } else {
       if (durationMs === null) {
         expiresAt = null;
@@ -161,7 +166,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       }
 
       await db
-        .insertInto('userMacros')
+        .insert(userMacros)
         .values({
           discordId,
           macro,
@@ -170,20 +175,18 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
           duration,
           expiresAt,
           licenseKeyId: licenseKey.id,
-        })
-        .execute();
+        });
     }
 
     // Create adminLog entry
     await db
-      .insertInto('adminLogs')
+      .insert(adminLogs)
       .values({
         action: 'license_redeem',
         actorDiscordId: discordId,
         targetDiscordId: discordId,
         details: JSON.stringify({ key: licenseKey.key, macro, duration }),
-      })
-      .execute();
+      });
 
     return reply.send({
       success: true,
@@ -200,10 +203,9 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const now = new Date();
 
     const macros = await db
-      .selectFrom('userMacros')
-      .selectAll()
-      .where('discordId', '=', discordId)
-      .execute();
+      .select()
+      .from(userMacros)
+      .where(eq(userMacros.discordId, discordId));
 
     const result = macros.map((m) => {
       let status: string;
@@ -250,11 +252,11 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     let licenseKey: any = null;
     for (const fmt of formats) {
-      const found = await db
-        .selectFrom('licenseKeys')
-        .selectAll()
-        .where('key', '=', fmt)
-        .executeTakeFirst();
+      const [found] = await db
+        .select()
+        .from(licenseKeys)
+        .where(eq(licenseKeys.key, fmt))
+        .limit(1);
       if (found) {
         licenseKey = found;
         break;
@@ -267,19 +269,19 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     // Ban the key
     await db
-      .updateTable('licenseKeys')
+      .update(licenseKeys)
       .set({ status: 'banned' })
-      .where('id', '=', licenseKey.id)
-      .execute();
+      .where(eq(licenseKeys.id, licenseKey.id));
 
     // If key was redeemed, revoke the corresponding userMacro
     if (licenseKey.discordId) {
       await db
-        .updateTable('userMacros')
+        .update(userMacros)
         .set({ status: 'revoked', updatedAt: new Date() })
-        .where('discordId', '=', licenseKey.discordId)
-        .where('macro', '=', licenseKey.macro)
-        .execute();
+        .where(and(
+          eq(userMacros.discordId, licenseKey.discordId),
+          eq(userMacros.macro, licenseKey.macro),
+        ));
     }
 
     return reply.send({ ok: true });
@@ -298,11 +300,11 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     let licenseKey: any = null;
     for (const fmt of formats) {
-      const found = await db
-        .selectFrom('licenseKeys')
-        .selectAll()
-        .where('key', '=', fmt)
-        .executeTakeFirst();
+      const [found] = await db
+        .select()
+        .from(licenseKeys)
+        .where(eq(licenseKeys.key, fmt))
+        .limit(1);
       if (found) {
         licenseKey = found;
         break;
@@ -317,27 +319,27 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const newStatus = licenseKey.discordId ? 'redeemed' : 'available';
 
     await db
-      .updateTable('licenseKeys')
+      .update(licenseKeys)
       .set({ status: newStatus })
-      .where('id', '=', licenseKey.id)
-      .execute();
+      .where(eq(licenseKeys.id, licenseKey.id));
 
     // If there was a revoked userMacro, restore it to 'active'
     if (licenseKey.discordId) {
-      const revokedMacro = await db
-        .selectFrom('userMacros')
-        .selectAll()
-        .where('discordId', '=', licenseKey.discordId)
-        .where('macro', '=', licenseKey.macro)
-        .where('status', '=', 'revoked')
-        .executeTakeFirst();
+      const [revokedMacro] = await db
+        .select()
+        .from(userMacros)
+        .where(and(
+          eq(userMacros.discordId, licenseKey.discordId),
+          eq(userMacros.macro, licenseKey.macro),
+          eq(userMacros.status, 'revoked'),
+        ))
+        .limit(1);
 
       if (revokedMacro) {
         await db
-          .updateTable('userMacros')
+          .update(userMacros)
           .set({ status: 'active', updatedAt: new Date() })
-          .where('id', '=', revokedMacro.id)
-          .execute();
+          .where(eq(userMacros.id, revokedMacro.id));
       }
     }
 
@@ -354,11 +356,12 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     await db
-      .updateTable('userMacros')
+      .update(userMacros)
       .set({ status: 'revoked', updatedAt: new Date() })
-      .where('discordId', '=', body.discordId)
-      .where('macro', '=', body.macro)
-      .execute();
+      .where(and(
+        eq(userMacros.discordId, body.discordId),
+        eq(userMacros.macro, body.macro),
+      ));
 
     return reply.send({ ok: true });
   });
@@ -372,13 +375,15 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       return reply.code(400).send({ error: 'Missing or invalid fields: discordId, macro, days' });
     }
 
-    const userMacro = await db
-      .selectFrom('userMacros')
-      .selectAll()
-      .where('discordId', '=', body.discordId)
-      .where('macro', '=', body.macro)
-      .where('status', '=', 'active')
-      .executeTakeFirst();
+    const [userMacro] = await db
+      .select()
+      .from(userMacros)
+      .where(and(
+        eq(userMacros.discordId, body.discordId),
+        eq(userMacros.macro, body.macro),
+        eq(userMacros.status, 'active'),
+      ))
+      .limit(1);
 
     if (!userMacro) {
       return reply.code(404).send({ error: 'No active macro found for this user' });
@@ -395,10 +400,9 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     await db
-      .updateTable('userMacros')
+      .update(userMacros)
       .set({ expiresAt: newExpiresAt, updatedAt: now })
-      .where('id', '=', userMacro.id)
-      .execute();
+      .where(eq(userMacros.id, userMacro.id));
 
     return reply.send({ ok: true, newExpiresAt: newExpiresAt.toISOString() });
   });

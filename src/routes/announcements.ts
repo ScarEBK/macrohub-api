@@ -1,5 +1,5 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, lte, or, desc, sql } from 'drizzle-orm';
+import { eq, and, lte, gt, isNull, or, desc } from 'drizzle-orm';
 import { announcements } from '../db/schema.js';
 import { adminAuth } from '../middleware/auth.js';
 
@@ -41,10 +41,13 @@ const announcementPlugin: FastifyPluginCallback = async (fastify) => {
       .select()
       .from(announcements)
       .where(
-        sql`${announcements.appId} = ${appId} AND ${announcements.startsAt} <= ${now} AND (${announcements.expiresAt} IS NULL OR ${announcements.expiresAt} > ${now})`,
+        and(
+          eq(announcements.appId, appId),
+          lte(announcements.startsAt, now),
+          or(isNull(announcements.expiresAt), gt(announcements.expiresAt, now)),
+        ),
       )
-      .orderBy(desc(announcements.startsAt))
-      .execute();
+      .orderBy(desc(announcements.startsAt));
 
     reply.send(result);
   });
@@ -75,8 +78,7 @@ const announcementPlugin: FastifyPluginCallback = async (fastify) => {
     if (data.replaceAll) {
       await db
         .delete(announcements)
-        .where(eq(announcements.appId, data.appId))
-        .execute();
+        .where(eq(announcements.appId, data.appId));
     }
 
     const [created] = await db
