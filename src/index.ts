@@ -4,6 +4,7 @@ import rateLimit from '@fastify/rate-limit';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './db/schema.js';
+import { runMigrations } from './db/migrate.js';
 
 import authRoutes from './routes/auth.js';
 import licenseRoutes from './routes/licenses.js';
@@ -17,6 +18,9 @@ import migrationRoutes from './routes/migration.js';
 
 const client = postgres(process.env.DATABASE_URL!);
 const db = drizzle(client, { schema });
+
+// ── Run idempotent schema migrations ────────────────────────────────────────
+await runMigrations(process.env.DATABASE_URL!);
 
 const app = Fastify({ logger: true });
 

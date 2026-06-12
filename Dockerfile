@@ -22,11 +22,10 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/package.json ./
 COPY drizzle.config.ts ./
-COPY src/db ./src/db
 
 ENV NODE_ENV=production
 
 EXPOSE 3001
 
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "npx drizzle-kit push && node dist/index.js"]
+CMD ["node", "dist/index.js"]
