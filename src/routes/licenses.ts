@@ -22,47 +22,52 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
   // ── POST /licenses/generate ───────────────────────────────────────────────
   app.post('/licenses/generate', { preHandler: adminAuth }, async (request, reply) => {
-    const body = request.body as { macro?: string; macroName?: string; duration?: string; durationLabel?: string; count?: number };
-
-    const macro = body?.macro ?? body?.macroName;
-    const duration = body?.duration ?? body?.durationLabel;
-    const count = body?.count;
-
-    if (!macro || !VALID_MACROS.includes(macro as any)) {
-      return reply.code(400).send({ error: 'Invalid macro. Must be one of: ' + VALID_MACROS.join(', ') });
-    }
-
-    if (!duration || !VALID_DURATIONS.includes(duration as any)) {
-      return reply.code(400).send({ error: 'Invalid duration. Must be one of: ' + VALID_DURATIONS.join(', ') });
-    }
-
-    if (!count || typeof count !== 'number' || count < 1 || count > 500) {
-      return reply.code(400).send({ error: 'Invalid count. Must be between 1 and 500.' });
-    }
-
-    const { db } = request.server;
-    const keys: string[] = [];
-
-    for (let i = 0; i < count; i++) {
-      keys.push(generateLicenseKey());
-    }
-
-    const values = keys.map((key) => ({
-      key,
-      macro,
-      duration,
-      status: 'available' as const,
-    }));
-
     try {
-      await db.insert(licenseKeys).values(values);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      request.log.error({ err }, `licenseKeys insert failed: ${msg}`);
-      return reply.code(500).send({ error: `Database insert failed: ${msg}` });
-    }
+      const body = request.body as { macro?: string; macroName?: string; duration?: string; durationLabel?: string; count?: number };
 
-    return reply.send({ keys });
+      const macro = body?.macro ?? body?.macroName;
+      const duration = body?.duration ?? body?.durationLabel;
+      const count = body?.count;
+
+      if (!macro || !VALID_MACROS.includes(macro as any)) {
+        return reply.code(400).send({ error: 'Invalid macro. Must be one of: ' + VALID_MACROS.join(', ') });
+      }
+
+      if (!duration || !VALID_DURATIONS.includes(duration as any)) {
+        return reply.code(400).send({ error: 'Invalid duration. Must be one of: ' + VALID_DURATIONS.join(', ') });
+      }
+
+      if (!count || typeof count !== 'number' || count < 1 || count > 500) {
+        return reply.code(400).send({ error: 'Invalid count. Must be between 1 and 500.' });
+      }
+
+      const { db } = request.server;
+      const keys: string[] = [];
+
+      for (let i = 0; i < count; i++) {
+        keys.push(generateLicenseKey());
+      }
+
+      const values = keys.map((key) => ({
+        key,
+        macro,
+        duration,
+        status: 'available' as const,
+      }));
+
+      try {
+        await db.insert(licenseKeys).values(values);
+      } catch (err: any) {
+        console.error('[DB INSERT ERROR]', err);
+        const msg = err?.message || String(err);
+        return reply.code(500).send({ error: `Database insert failed: ${msg}` });
+      }
+
+      return reply.send({ keys });
+    } catch (err: any) {
+      console.error('[GENERATE ERROR]', err);
+      return reply.code(500).send({ error: err?.message || String(err) });
+    }
   });
 
   // ── POST /licenses/redeem ─────────────────────────────────────────────────
