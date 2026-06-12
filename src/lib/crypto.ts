@@ -43,7 +43,7 @@ export function generateSessionToken(): string {
 
 export function generateLicenseKey(): string {
   const segments: string[] = [];
-  for (let s = 0; s < 4; s++) {
+  for (let s = 0; s < 6; s++) {
     let segment = '';
     for (let i = 0; i < 4; i++) {
       segment += LICENSE_CHARS[crypto.randomInt(LICENSE_CHARS.length)];
@@ -65,7 +65,7 @@ export function generateReferralCode(discordId: string): string {
 export function normalizeLicenseKey(key: string): string[] {
   const stripped = key.replace(/[-\s]/g, '').toUpperCase();
 
-  // Format 1: dashes every 4 chars (XXXX-XXXX-XXXX-XXXX)
+  // Format 1: dashes every 4 chars (XXXX-XXXX-XXXX-XXXX-XXXX-XXXX)
   const withDashes = stripped.match(/.{1,4}/g)?.join('-') ?? stripped;
 
   // Format 2: no dashes

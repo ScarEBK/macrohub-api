@@ -336,10 +336,14 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
         .limit(1);
 
       if (revokedMacro) {
-        await db
-          .update(userMacros)
-          .set({ status: 'active', updatedAt: new Date() })
-          .where(eq(userMacros.id, revokedMacro.id));
+        const now = new Date();
+        const stillValid = !revokedMacro.expiresAt || new Date(revokedMacro.expiresAt) > now;
+        if (stillValid) {
+          await db
+            .update(userMacros)
+            .set({ status: 'active', updatedAt: now })
+            .where(eq(userMacros.id, revokedMacro.id));
+        }
       }
     }
 

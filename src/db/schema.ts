@@ -20,15 +20,18 @@ export const users = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     discordId: varchar("discord_id", { length: 255 }).notNull(),
     username: varchar("username", { length: 255 }).notNull(),
-    avatar: text("avatar"),
+    avatarUrl: text("avatar_url"),
     hwid: text("hwid"),
     hwidResetAllowed: boolean("hwid_reset_allowed").default(false),
+    hwidResetCount: integer("hwid_reset_count").default(0),
     referredByDiscordId: varchar("referred_by_discord_id", { length: 255 }),
     createdAt: timestamp("created_at").defaultNow(),
     updatedAt: timestamp("updated_at").defaultNow(),
+    lastSeenAt: timestamp("last_seen_at").defaultNow(),
   },
   (table) => [
     uniqueIndex("users_discord_id_unique").on(table.discordId),
+    index("users_hwid_idx").on(table.hwid),
   ],
 );
 
@@ -84,6 +87,7 @@ export const licenseKeys = pgTable(
     macro: varchar("macro", { length: 100 }).notNull(),
     duration: varchar("duration", { length: 20 }).notNull(),
     discordId: varchar("discord_id", { length: 255 }),
+    redeemedBy: varchar("redeemed_by", { length: 255 }),
     sellauthOrderId: varchar("sellauth_order_id", { length: 255 }),
     createdAt: timestamp("created_at").defaultNow(),
     redeemedAt: timestamp("redeemed_at"),
@@ -131,6 +135,7 @@ export const pendingEntitlements = pgTable(
     duration: varchar("duration", { length: 20 }).notNull(),
     source: varchar("source", { length: 20 }).notNull().default("sellauth"),
     orderId: varchar("order_id", { length: 255 }),
+    expiresAt: timestamp("expires_at"),
     createdAt: timestamp("created_at").defaultNow(),
   },
   (table) => [
@@ -186,6 +191,7 @@ export const announcements = pgTable(
     title: text("title").notNull(),
     body: text("body").notNull(),
     imageUrl: text("image_url"),
+    dismissible: boolean("dismissible").default(false),
     startsAt: timestamp("starts_at").notNull().defaultNow(),
     expiresAt: timestamp("expires_at"),
     createdAt: timestamp("created_at").defaultNow(),

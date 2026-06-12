@@ -1,5 +1,5 @@
 import { FastifyInstance, FastifyPluginCallback } from 'fastify';
-import { eq, and, lt } from 'drizzle-orm';
+import { eq, and, lt, gt } from 'drizzle-orm';
 import {
   users,
   desktopSessions,
@@ -9,7 +9,7 @@ import {
   referralEvents,
   userMacros,
 } from '../db/schema.js';
-import { verifyOAuthProof, generateSessionToken } from '../lib/crypto.js';
+import { verifyOAuthProof, generateSessionToken, timingSafeEqual } from '../lib/crypto.js';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
@@ -35,9 +35,13 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     const adminSecret = request.headers['x-admin-secret'];
     const isAdminBypass = typeof adminSecret === 'string'
       && process.env.ADMIN_SECRET
-      && adminSecret === process.env.ADMIN_SECRET;
+      && timingSafeEqual(adminSecret, process.env.ADMIN_SECRET);
 
     if (!isAdminBypass) {
+      // Mandatory OAuth proof when MOTIONCORD_DESKTOP_SECRET is configured
+      if (!MOTIONCORD_DESKTOP_SECRET) {
+        return reply.code(500).send({ error: 'Server misconfiguration: OAuth secret missing' });
+      }
       if (!verifyOAuthProof(discordId, issuedAt, oauthProof, MOTIONCORD_DESKTOP_SECRET)) {
         return reply.code(401).send({ error: 'Invalid OAuth proof' });
       }
@@ -52,17 +56,19 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       const inserted = await db.insert(users).values({
         discordId,
         username,
-        avatar: avatar ?? null,
+        avatarUrl: avatar ?? null,
         hwid,
+        lastSeenAt: new Date(),
       }).returning();
       user = inserted[0];
     } else {
       // Update username/avatar on each login
       await db.update(users).set({
         username,
-        avatar: avatar ?? user.avatar,
+        avatarUrl: avatar ?? user.avatarUrl,
+        lastSeenAt: new Date(),
       }).where(eq(users.discordId, discordId));
-      user = { ...user, username, avatar: avatar ?? user.avatar };
+      user = { ...user, username, avatarUrl: avatar ?? user.avatarUrl };
     }
 
     // ── 3. HWID binding logic ──────────────────────────────────────────────────
@@ -75,8 +81,9 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
           await db.update(users).set({ hwid }).where(eq(users.discordId, discordId));
           user = { ...user, hwid };
         } else if (user.hwidResetAllowed) {
-          await db.update(users).set({ hwid, hwidResetAllowed: false }).where(eq(users.discordId, discordId));
-          user = { ...user, hwid, hwidResetAllowed: false };
+          const newCount = (user.hwidResetCount ?? 0) + 1;
+          await db.update(users).set({ hwid, hwidResetAllowed: false, hwidResetCount: newCount }).where(eq(users.discordId, discordId));
+          user = { ...user, hwid, hwidResetAllowed: false, hwidResetCount: newCount };
         } else {
           return reply.code(403).send({ error: 'HWID_MISMATCH' });
         }
@@ -91,6 +98,12 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       .where(eq(pendingEntitlements.discordId, discordId));
 
     for (const ent of entitlements) {
+      // Skip if entitlement has expired
+      if (ent.expiresAt && new Date(ent.expiresAt) <= new Date()) {
+        await db.delete(pendingEntitlements).where(eq(pendingEntitlements.id, ent.id));
+        continue;
+      }
+
       await db.insert(userMacros).values({
         discordId,
         macro: ent.macro,
@@ -156,7 +169,7 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       user: {
         discordId: user.discordId,
         username: user.username,
-        avatar: user.avatar,
+        avatarUrl: user.avatarUrl,
         hwid: user.hwid,
         referredByDiscordId: user.referredByDiscordId ?? null,
       },
@@ -185,7 +198,7 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       user: {
         discordId: user.discordId,
         username: user.username,
-        avatar: user.avatar,
+        avatarUrl: user.avatarUrl,
         hwid: user.hwid,
       },
       macros,
