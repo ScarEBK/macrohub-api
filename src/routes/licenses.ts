@@ -22,22 +22,25 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
   // ── POST /licenses/generate ───────────────────────────────────────────────
   app.post('/licenses/generate', { preHandler: adminAuth }, async (request, reply) => {
-    const body = request.body as { macro?: string; duration?: string; count?: number };
+    const body = request.body as { macro?: string; macroName?: string; duration?: string; durationLabel?: string; count?: number };
 
-    if (!body?.macro || !VALID_MACROS.includes(body.macro as any)) {
+    const macro = body?.macro ?? body?.macroName;
+    const duration = body?.duration ?? body?.durationLabel;
+    const count = body?.count;
+
+    if (!macro || !VALID_MACROS.includes(macro as any)) {
       return reply.code(400).send({ error: 'Invalid macro. Must be one of: ' + VALID_MACROS.join(', ') });
     }
 
-    if (!body?.duration || !VALID_DURATIONS.includes(body.duration as any)) {
+    if (!duration || !VALID_DURATIONS.includes(duration as any)) {
       return reply.code(400).send({ error: 'Invalid duration. Must be one of: ' + VALID_DURATIONS.join(', ') });
     }
 
-    if (!body?.count || typeof body.count !== 'number' || body.count < 1 || body.count > 500) {
+    if (!count || typeof count !== 'number' || count < 1 || count > 500) {
       return reply.code(400).send({ error: 'Invalid count. Must be between 1 and 500.' });
     }
 
     const { db } = request.server;
-    const { macro, duration, count } = body;
     const keys: string[] = [];
 
     for (let i = 0; i < count; i++) {
