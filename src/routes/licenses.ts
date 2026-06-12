@@ -129,7 +129,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .update(licenseKeys)
       .set({
         status: 'redeemed',
-        discordId,
+        redeemedBy: discordId,
         redeemedAt: now,
       })
       .where(eq(licenseKeys.id, licenseKey.id));
@@ -288,12 +288,12 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .where(eq(licenseKeys.id, licenseKey.id));
 
     // If key was redeemed, revoke the corresponding userMacro
-    if (licenseKey.discordId) {
+    if (licenseKey.redeemedBy) {
       await db
         .update(userMacros)
         .set({ status: 'revoked', updatedAt: new Date() })
         .where(and(
-          eq(userMacros.discordId, licenseKey.discordId),
+          eq(userMacros.discordId, licenseKey.redeemedBy),
           eq(userMacros.macro, licenseKey.macro),
         ));
     }
@@ -330,7 +330,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     // Restore key status: 'available' if not previously redeemed, 'redeemed' if was redeemed
-    const newStatus = licenseKey.discordId ? 'redeemed' : 'available';
+    const newStatus = licenseKey.redeemedBy ? 'redeemed' : 'available';
 
     await db
       .update(licenseKeys)
@@ -338,12 +338,12 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .where(eq(licenseKeys.id, licenseKey.id));
 
     // If there was a revoked userMacro, restore it to 'active'
-    if (licenseKey.discordId) {
+    if (licenseKey.redeemedBy) {
       const [revokedMacro] = await db
         .select()
         .from(userMacros)
         .where(and(
-          eq(userMacros.discordId, licenseKey.discordId),
+          eq(userMacros.discordId, licenseKey.redeemedBy),
           eq(userMacros.macro, licenseKey.macro),
           eq(userMacros.status, 'revoked'),
         ))

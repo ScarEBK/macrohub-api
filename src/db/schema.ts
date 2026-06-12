@@ -86,7 +86,6 @@ export const licenseKeys = pgTable(
     status: varchar("status", { length: 20 }).notNull().default("available"),
     macro: varchar("macro", { length: 100 }).notNull(),
     duration: varchar("duration", { length: 20 }).notNull(),
-    discordId: varchar("discord_id", { length: 255 }),
     redeemedBy: varchar("redeemed_by", { length: 255 }),
     sellauthOrderId: varchar("sellauth_order_id", { length: 255 }),
     createdAt: timestamp("created_at").defaultNow(),

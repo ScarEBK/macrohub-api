@@ -268,7 +268,7 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
 
             await db
               .update(licenseKeys)
-              .set({ status: 'redeemed', discordId, redeemedAt: new Date() })
+              .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
               .where(eq(licenseKeys.id, lk.id));
           }
         } else {
@@ -348,7 +348,7 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
 
         await db
           .update(licenseKeys)
-          .set({ status: 'redeemed', discordId, redeemedAt: new Date() })
+          .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
           .where(eq(licenseKeys.key, key));
       } else {
         // User not found — create migration claim
