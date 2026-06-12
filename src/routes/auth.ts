@@ -22,13 +22,22 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       discordId: string;
       username: string;
       avatar?: string;
+      avatarUrl?: string;
       hwid: string;
       oauthProof: string;
-      issuedAt: number;
+      issuedAt?: number;
+      oauthProofAt?: number;
       referralCode?: string;
     };
   }>('/auth/oauth', async (request, reply) => {
-    const { discordId, username, avatar, hwid, oauthProof, issuedAt, referralCode } = request.body;
+    const body = request.body;
+    const discordId = body.discordId;
+    const username = body.username;
+    const avatar = body.avatar ?? body.avatarUrl;
+    const hwid = body.hwid;
+    const oauthProof = body.oauthProof;
+    const issuedAt = body.issuedAt ?? body.oauthProofAt ?? 0;
+    const referralCode = body.referralCode;
     const { db } = request.server;
 
     // ── 1. Verify OAuth proof or admin secret ──────────────────────────────────
