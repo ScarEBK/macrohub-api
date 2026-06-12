@@ -57,6 +57,9 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       if (!MOTIONCORD_DESKTOP_SECRET) {
         return reply.code(500).send({ error: 'Server misconfiguration: OAuth secret missing' });
       }
+      if (!oauthProof) {
+        return reply.code(401).send({ error: 'Missing OAuth proof — MotionCord secret may not be configured' });
+      }
       if (!verifyOAuthProof(discordId, issuedAt, oauthProof, MOTIONCORD_DESKTOP_SECRET)) {
         return reply.code(401).send({ error: 'Invalid OAuth proof' });
       }

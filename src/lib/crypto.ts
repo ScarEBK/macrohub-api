@@ -8,11 +8,15 @@ const REFERRAL_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 export function verifyOAuthProof(
   discordId: string,
   issuedAt: number,
-  proof: string,
+  proof: string | null | undefined,
   secret: string,
 ): boolean {
   const now = Date.now();
   if (Math.abs(now - issuedAt) > FIVE_MINUTES_MS) {
+    return false;
+  }
+
+  if (!proof || typeof proof !== 'string') {
     return false;
   }
 
@@ -81,6 +85,7 @@ export function normalizeLicenseKey(key: string): string[] {
 }
 
 export function timingSafeEqual(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }

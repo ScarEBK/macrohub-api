@@ -74,8 +74,8 @@ const announcementPlugin: FastifyPluginCallback = async (fastify) => {
       return;
     }
 
-    // If replaceAll, delete all existing announcements for this appId
-    if (data.replaceAll) {
+    // If replaceAll (or replaceExisting for backward compat with bot), delete all existing announcements for this appId
+    if (data.replaceAll || (data as any).replaceExisting) {
       await db
         .delete(announcements)
         .where(eq(announcements.appId, data.appId));
