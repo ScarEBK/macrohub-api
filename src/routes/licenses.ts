@@ -51,10 +51,16 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       key,
       macro,
       duration,
-      status: 'available',
+      status: 'available' as const,
     }));
 
-    await db.insert(licenseKeys).values(values);
+    try {
+      await db.insert(licenseKeys).values(values);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      request.log.error({ err }, `licenseKeys insert failed: ${msg}`);
+      return reply.code(500).send({ error: `Database insert failed: ${msg}` });
+    }
 
     return reply.send({ keys });
   });
