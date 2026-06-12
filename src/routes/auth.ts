@@ -37,6 +37,7 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     const hwid = body.hwid;
     const oauthProof = body.oauthProof;
     const issuedAt = body.issuedAt ?? body.oauthProofAt ?? 0;
+
     const referralCode = body.referralCode;
     const { db } = request.server;
 
@@ -45,6 +46,11 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     const isAdminBypass = typeof adminSecret === 'string'
       && process.env.ADMIN_SECRET
       && timingSafeEqual(adminSecret, process.env.ADMIN_SECRET);
+
+    // Validate OAuth proof timestamp (skip if admin bypass)
+    if (!isAdminBypass && !body.issuedAt && !body.oauthProofAt) {
+      return reply.code(400).send({ error: 'Missing OAuth proof timestamp (issuedAt or oauthProofAt)' });
+    }
 
     if (!isAdminBypass) {
       // Mandatory OAuth proof when MOTIONCORD_DESKTOP_SECRET is configured

@@ -45,7 +45,20 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       const keys: string[] = [];
 
       for (let i = 0; i < count; i++) {
-        keys.push(generateLicenseKey());
+        let key = generateLicenseKey();
+        let attempts = 0;
+        // Collision detection: ensure key doesn't already exist
+        while (attempts < 5) {
+          const [existing] = await db
+            .select({ id: licenseKeys.id })
+            .from(licenseKeys)
+            .where(eq(licenseKeys.key, key))
+            .limit(1);
+          if (!existing) break;
+          key = generateLicenseKey();
+          attempts++;
+        }
+        keys.push(key);
       }
 
       const values = keys.map((key) => ({
@@ -150,16 +163,19 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .limit(1);
 
     let expiresAt: Date | null;
+    let expiresAtMs: number | null;
 
     if (existingMacro) {
       if (durationMs === null) {
         // Lifetime — no expiry
         expiresAt = null;
+        expiresAtMs = null;
       } else {
         const baseDate = existingMacro.expiresAt && new Date(existingMacro.expiresAt) > now
           ? new Date(existingMacro.expiresAt)
           : now;
         expiresAt = new Date(baseDate.getTime() + durationMs);
+        expiresAtMs = expiresAt.getTime();
       }
 
       await db
@@ -169,14 +185,17 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
           source: 'redeem',
           duration,
           expiresAt,
+          licenseKeyId: licenseKey.id,
           updatedAt: now,
         })
         .where(eq(userMacros.id, existingMacro.id));
     } else {
       if (durationMs === null) {
         expiresAt = null;
+        expiresAtMs = null;
       } else {
         expiresAt = new Date(now.getTime() + durationMs);
+        expiresAtMs = expiresAt.getTime();
       }
 
       await db
@@ -206,7 +225,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       success: true,
       macro,
       duration,
-      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+      expiresAt: expiresAtMs,
     });
   });
 
@@ -240,7 +259,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
         status,
         source: m.source,
         duration: m.duration,
-        expiresAt: m.expiresAt ? new Date(m.expiresAt).toISOString() : null,
+        expiresAt: m.expiresAt ? new Date(m.expiresAt).getTime() : null,
       };
     });
 

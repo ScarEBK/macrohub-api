@@ -1,7 +1,7 @@
 import { FastifyPluginCallback } from 'fastify';
 import { desc, sql } from 'drizzle-orm';
-import { clientReports } from '../db/schema.js';
-import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
+import { clientReports, desktopSessions } from '../db/schema.js';
+import { adminAuth } from '../middleware/auth.js';
 
 const MAX_MESSAGE_LENGTH = 1000;
 const MAX_STACK_LENGTH = 2000;
@@ -16,32 +16,29 @@ interface SubmitBody {
 const reportPlugin: FastifyPluginCallback = async (fastify) => {
   const db = fastify.db;
 
-  // ── POST /reports/submit ────────────────────────────────────────────────
-  fastify.post('/reports/submit', {
+  // ── POST /submit ────────────────────────────────────────────────────────
+  fastify.post('/submit', {
     config: {
       rateLimit: { max: 30, timeWindow: '1 minute' },
     },
   }, async (request, reply) => {
-    // Optional auth — anonymous reports are allowed
+    // Optional auth — extract session token manually without sending error responses
     let discordId: string | null = null;
 
-    try {
-      await desktopSessionAuth(request, reply);
-      if (!reply.sent) {
-        discordId = (request as AuthenticatedRequest).session.discordId;
+    const token = request.headers['x-session-token'];
+    if (typeof token === 'string' && token.length > 0) {
+      try {
+        const [session] = await db
+          .select({ discordId: desktopSessions.discordId })
+          .from(desktopSessions)
+          .where(sql`${desktopSessions.token} = ${token}`)
+          .limit(1);
+        if (session) {
+          discordId = session.discordId;
+        }
+      } catch {
+        // Session lookup failed — proceed as anonymous
       }
-    } catch {
-      // Not authenticated — proceed as anonymous
-    }
-
-    // Reset reply.sent if auth failed but we want to continue
-    if (reply.sent) {
-      // Auth middleware already sent an error response — but for optional auth
-      // we should NOT block. Since reply.sent means a response was already sent,
-      // we can't continue. This handles the edge case where auth sends 401.
-      // For truly optional auth, we should not have called desktopSessionAuth
-      // in a way that sends a response on failure. Let's handle this properly:
-      return;
     }
 
     const data = request.body as SubmitBody;

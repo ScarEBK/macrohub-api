@@ -16,11 +16,35 @@ import reportRoutes from './routes/reports.js';
 import adminRoutes from './routes/admin.js';
 import migrationRoutes from './routes/migration.js';
 
-const client = postgres(process.env.DATABASE_URL!);
+// ── Database connection with retry ──────────────────────────────────────────
+async function connectDatabase(dbUrl: string, maxRetries = 5): Promise<ReturnType<typeof postgres>> {
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const client = postgres(dbUrl);
+      // Verify connection with a simple query
+      await client`SELECT 1`;
+      console.log(`[db] Connected on attempt ${attempt}`);
+      return client;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[db] Connection attempt ${attempt} failed: ${lastError.message}`);
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+        console.log(`[db] Retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw new Error(`Failed to connect to database after ${maxRetries} attempts: ${lastError?.message}`);
+}
+
+const dbUrl = process.env.DATABASE_URL!;
+const client = await connectDatabase(dbUrl);
 const db = drizzle(client, { schema });
 
 // ── Run idempotent schema migrations ────────────────────────────────────────
-await runMigrations(process.env.DATABASE_URL!);
+await runMigrations(dbUrl);
 
 const app = Fastify({ logger: true });
 

@@ -11,9 +11,9 @@ export interface AuthenticatedRequest extends FastifyRequest {
 }
 
 export async function adminAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
-  const adminSecret = process.env.ADMIN_SECRET;
+  const adminSecret = process.env.ADMIN_SECRET || process.env.CONVEX_ADMIN_SECRET;
   if (!adminSecret) {
-    request.log.error('ADMIN_SECRET env var is not set');
+    request.log.error('ADMIN_SECRET (or CONVEX_ADMIN_SECRET) env var is not set');
     reply.code(500).send({ error: 'Server misconfiguration' });
     return;
   }

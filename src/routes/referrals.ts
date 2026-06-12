@@ -64,12 +64,7 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     const activeMacroCount = activeMacros.length;
 
-    // Calculate reward days
-    // Install: 3 days per install per active macro (capped at 10 installs)
-    // Purchase: varies by duration per purchase per active macro
-    let rewardDays = installCount * 3 * activeMacroCount;
-
-    // Add purchase rewards based on duration
+    // Fetch purchase referral events for reward calculation
     const purchaseDetails = await db
       .select({ duration: referralEvents.duration })
       .from(referralEvents)
@@ -78,24 +73,24 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
         eq(referralEvents.eventType, 'purchase'),
       ));
 
+    // Calculate purchase rewards by duration tier
+    const purchaseRewards = { week: 0, month: 0, lifetime: 0 };
     for (const purchase of purchaseDetails) {
       const duration = purchase.duration;
-      let days = 2;
       if (duration === '7d') {
-        days = 2;
+        purchaseRewards.week++;
       } else if (duration === '1m') {
-        days = 5;
+        purchaseRewards.month++;
       } else if (duration === 'lifetime') {
-        days = 7;
+        purchaseRewards.lifetime++;
       }
-      rewardDays += days * activeMacroCount;
     }
 
     return reply.send({
       code: codeResult.code,
-      installCount,
-      purchaseCount,
-      rewardDays,
+      linkHint: `https://motionlife.mysellauth.com?ref=${codeResult.code}`,
+      installRewardDays: 3,
+      purchaseRewards,
     });
   });
 
