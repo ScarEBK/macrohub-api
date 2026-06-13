@@ -46,15 +46,9 @@ export function generateSessionToken(): string {
 }
 
 export function generateLicenseKey(): string {
-  const segments: string[] = [];
-  for (let s = 0; s < 6; s++) {
-    let segment = '';
-    for (let i = 0; i < 4; i++) {
-      segment += LICENSE_CHARS[crypto.randomInt(LICENSE_CHARS.length)];
-    }
-    segments.push(segment);
-  }
-  return segments.join('-');
+  const bytes = crypto.randomBytes(8);
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+  return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}`;
 }
 
 export function generateReferralCode(discordId: string): string {
@@ -67,21 +61,13 @@ export function generateReferralCode(discordId: string): string {
 }
 
 export function normalizeLicenseKey(key: string): string[] {
-  const stripped = key.replace(/[-\s]/g, '').toUpperCase();
+  const stripped = key.trim().toUpperCase().replace(/[\s-]/g, '');
+  if (stripped.length !== 16) return [stripped];
 
-  // Format 1: dashes every 4 chars (XXXX-XXXX-XXXX-XXXX-XXXX-XXXX)
-  const withDashes = stripped.match(/.{1,4}/g)?.join('-') ?? stripped;
+  // Primary: XXXX-XXXX-XXXX-XXXX (dash-separated 4-char groups)
+  const withDashes = `${stripped.slice(0, 4)}-${stripped.slice(4, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}`;
 
-  // Format 2: no dashes
-  const noDashes = stripped;
-
-  // Format 3: dashes with different grouping for 16-char keys (XXXXXX-XX-XXXXXX)
-  let altGrouping = stripped;
-  if (stripped.length === 16) {
-    altGrouping = `${stripped.slice(0, 6)}-${stripped.slice(6, 8)}-${stripped.slice(8)}`;
-  }
-
-  return [withDashes, noDashes, altGrouping];
+  return [withDashes, stripped];
 }
 
 export function timingSafeEqual(a: string, b: string): boolean {

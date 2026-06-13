@@ -41,6 +41,84 @@ const MIGRATIONS = [
   { name: 'add pending_entitlements.expires_at',
     sql: `ALTER TABLE pending_entitlements ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;`,
   },
+
+  // 5. trial_registrations: add new columns matching Convex
+  { name: 'add trial_registrations.discord_username',
+    sql: `ALTER TABLE trial_registrations ADD COLUMN IF NOT EXISTS discord_username VARCHAR(255);`,
+  },
+  { name: 'add trial_registrations.email',
+    sql: `ALTER TABLE trial_registrations ADD COLUMN IF NOT EXISTS email VARCHAR(500);`,
+  },
+  { name: 'add trial_registrations.interest_reason',
+    sql: `ALTER TABLE trial_registrations ADD COLUMN IF NOT EXISTS interest_reason TEXT;`,
+  },
+  { name: 'add trial_registrations.started_at',
+    sql: `ALTER TABLE trial_registrations ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT NOW();`,
+  },
+  { name: 'add trial_registrations.expires_at',
+    sql: `ALTER TABLE trial_registrations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;`,
+  },
+
+  // 6. client_reports: add new columns matching Convex
+  { name: 'add client_reports.discord_username',
+    sql: `ALTER TABLE client_reports ADD COLUMN IF NOT EXISTS discord_username VARCHAR(255);`,
+  },
+  { name: 'add client_reports.app_version',
+    sql: `ALTER TABLE client_reports ADD COLUMN IF NOT EXISTS app_version VARCHAR(32);`,
+  },
+  { name: 'add client_reports.hwid_prefix',
+    sql: `ALTER TABLE client_reports ADD COLUMN IF NOT EXISTS hwid_prefix VARCHAR(32) DEFAULT 'unknown';`,
+  },
+  { name: 'add client_reports.severity',
+    sql: `DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'client_reports' AND column_name = 'severity')
+      THEN
+        ALTER TABLE client_reports ADD COLUMN severity VARCHAR(20) NOT NULL DEFAULT 'error';
+      END IF;
+    END $$;`,
+  },
+  { name: 'add client_reports.route',
+    sql: `ALTER TABLE client_reports ADD COLUMN IF NOT EXISTS route VARCHAR(256);`,
+  },
+  { name: 'migrate client_reports.type to severity',
+    sql: `DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'client_reports' AND column_name = 'type')
+        AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'client_reports' AND column_name = 'severity')
+      THEN
+        ALTER TABLE client_reports RENAME COLUMN type TO severity;
+      END IF;
+    END $$;`,
+  },
+  { name: 'alter client_reports.message not null',
+    sql: `DO $$ BEGIN
+      -- Make message NOT NULL if it isn't already
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'client_reports' AND column_name = 'message' AND is_nullable = 'YES')
+      THEN
+        UPDATE client_reports SET message = '(no message)' WHERE message IS NULL;
+        ALTER TABLE client_reports ALTER COLUMN message SET NOT NULL;
+      END IF;
+    END $$;`,
+  },
+  { name: 'alter client_reports.context type to text',
+    sql: `DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'client_reports' AND column_name = 'context' AND data_type = 'jsonb')
+      THEN
+        -- Migrate jsonb context to text
+        ALTER TABLE client_reports ADD COLUMN IF NOT EXISTS context_text TEXT;
+        UPDATE client_reports SET context_text = context::text WHERE context IS NOT NULL;
+        ALTER TABLE client_reports DROP COLUMN context;
+        ALTER TABLE client_reports RENAME COLUMN context_text TO context;
+      END IF;
+    END $$;`,
+  },
+
+  // 7. announcements: add created_by_discord_id
+  { name: 'add announcements.created_by_discord_id',
+    sql: `ALTER TABLE announcements ADD COLUMN IF NOT EXISTS created_by_discord_id VARCHAR(255);`,
+  },
+  { name: 'alter announcements.dismissible default to true',
+    sql: `ALTER TABLE announcements ALTER COLUMN dismissible SET DEFAULT TRUE;`,
+  },
 ];
 
 export async function runMigrations(dbUrl: string) {
