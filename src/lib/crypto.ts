@@ -62,12 +62,17 @@ export function generateReferralCode(discordId: string): string {
 
 export function normalizeLicenseKey(key: string): string[] {
   const stripped = key.trim().toUpperCase().replace(/[\s-]/g, '');
-  if (stripped.length !== 16) return [stripped];
-
-  // Primary: XXXX-XXXX-XXXX-XXXX (dash-separated 4-char groups)
-  const withDashes = `${stripped.slice(0, 4)}-${stripped.slice(4, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}`;
-
-  return [withDashes, stripped];
+  if (stripped.length === 32) {
+    const withDashes =
+      `${stripped.slice(0, 4)}-${stripped.slice(4, 8)}-${stripped.slice(8, 12)}-` +
+      `${stripped.slice(12, 16)}-${stripped.slice(16, 20)}-${stripped.slice(20, 24)}`;
+    return [withDashes, stripped];
+  }
+  if (stripped.length === 16) {
+    const withDashes = `${stripped.slice(0, 4)}-${stripped.slice(4, 8)}-${stripped.slice(8, 12)}-${stripped.slice(12, 16)}`;
+    return [withDashes, stripped];
+  }
+  return [stripped];
 }
 
 export function timingSafeEqual(a: string, b: string): boolean {
