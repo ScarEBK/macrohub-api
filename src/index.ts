@@ -5,6 +5,7 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './db/schema.js';
 import { runMigrations } from './db/migrate.js';
+import { ensureSchema } from './db/ensure-schema.js';
 
 import authRoutes from './routes/auth.js';
 import licenseRoutes from './routes/licenses.js';
@@ -43,7 +44,8 @@ const dbUrl = process.env.DATABASE_URL!;
 const client = await connectDatabase(dbUrl);
 const db = drizzle(client, { schema });
 
-// ── Run idempotent schema migrations ────────────────────────────────────────
+// ── Create tables if missing, then run column migrations ───────────────────
+await ensureSchema(dbUrl);
 await runMigrations(dbUrl);
 
 const app = Fastify({ logger: true });

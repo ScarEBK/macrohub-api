@@ -5,12 +5,13 @@ import { generateLicenseKey, normalizeLicenseKey } from '../lib/crypto.js';
 import { licenseKeys, userMacros, adminLogs, users } from '../db/schema.js';
 
 const VALID_MACROS = ['Speed Boost', 'Glitch Roll', 'Strafe'] as const;
-const VALID_DURATIONS = ['1d', '7d', '1m', 'lifetime'] as const;
+const VALID_DURATIONS = ['1d', '7d', '1m', '30d', 'lifetime'] as const;
 
 const DURATION_MS: Record<string, number | null> = {
   '1d': 24 * 60 * 60 * 1000,
   '7d': 7 * 24 * 60 * 60 * 1000,
   '1m': 30 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000,
   lifetime: null,
 };
 
