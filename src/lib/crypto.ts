@@ -46,9 +46,9 @@ export function generateSessionToken(): string {
 }
 
 export function generateLicenseKey(): string {
-  const bytes = crypto.randomBytes(8);
+  const bytes = crypto.randomBytes(16);
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-  return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}`;
+  return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 24)}`;
 }
 
 export function generateReferralCode(discordId: string): string {

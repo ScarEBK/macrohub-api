@@ -16,6 +16,7 @@ import announcementRoutes from './routes/announcements.js';
 import reportRoutes from './routes/reports.js';
 import adminRoutes from './routes/admin.js';
 import migrationRoutes from './routes/migration.js';
+import importSnapshotRoutes from './routes/import-snapshot.js';
 
 // ── Database connection with retry ──────────────────────────────────────────
 async function connectDatabase(dbUrl: string, maxRetries = 5): Promise<ReturnType<typeof postgres>> {
@@ -87,6 +88,7 @@ await app.register(reportRoutes, {
   prefix: '/reports',
 });
 await app.register(adminRoutes);
+await app.register(importSnapshotRoutes);
 await app.register(migrationRoutes);
 
 // ── Start server ────────────────────────────────────────────────────────────
