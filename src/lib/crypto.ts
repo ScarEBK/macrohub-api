@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-const FIVE_MINUTES_MS = 5 * 60 * 1000;
+const THIRTY_MINUTES_MS = 30 * 60 * 1000;
 
 const LICENSE_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 const REFERRAL_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
@@ -12,7 +12,7 @@ export function verifyOAuthProof(
   secret: string,
 ): boolean {
   const now = Date.now();
-  if (Math.abs(now - issuedAt) > FIVE_MINUTES_MS) {
+  if (Math.abs(now - issuedAt) > THIRTY_MINUTES_MS) {
     return false;
   }
 
