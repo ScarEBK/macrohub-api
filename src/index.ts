@@ -53,8 +53,16 @@ await app.register(cors, { origin: true });
 
 // ── Rate limiting ───────────────────────────────────────────────────────────
 await app.register(rateLimit, {
-  max: 1000,
+  max: 5000,
   timeWindow: '1 minute',
+  keyGenerator: (request) => {
+    // Skip rate limiting for admin requests (already auth'd by x-admin-secret)
+    const adminSecret = request.headers['x-admin-secret'];
+    if (typeof adminSecret === 'string' && adminSecret.length > 0) {
+      return `admin:${request.ip}`;
+    }
+    return request.ip;
+  },
 });
 
 // ── Decorate with db ────────────────────────────────────────────────────────
