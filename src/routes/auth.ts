@@ -1,5 +1,5 @@
 import { FastifyInstance, FastifyPluginCallback } from 'fastify';
-import { eq, and, lt, gt } from 'drizzle-orm';
+import { eq, and, lt, gt, or, ilike } from 'drizzle-orm';
 import {
   users,
   desktopSessions,
@@ -14,6 +14,60 @@ import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middlewa
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const MOTIONCORD_DESKTOP_SECRET = process.env.MOTIONCORD_DESKTOP_SECRET ?? '';
+
+// Duration → milliseconds (lifetime = null expiry). Used by the migration-claim
+// merge to extend timed macros when a returning customer has multiple claims
+// for the same macro (stacking).
+const DURATION_MS_AUTH: Record<string, number | null> = {
+  '1d': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  '1m': 30 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000,
+  'lifetime': null,
+};
+
+/**
+ * Upsert a userMacro with extend-on-conflict semantics (mirrors
+ * /licenses/redeem + /migration/import-row). Used by the migration-claim merge
+ * so a returning customer with multiple pending claims for the same macro gets
+ * them stacked (extended) rather than silently dropped (onConflictDoNothing).
+ */
+async function upsertUserMacroExtendAuth(
+  db: any,
+  discordId: string,
+  macro: string,
+  duration: string,
+): Promise<void> {
+  const durationMs = DURATION_MS_AUTH[duration] ?? (30 * 24 * 60 * 60 * 1000);
+  const lifetime = duration === 'lifetime' || durationMs === null;
+
+  const existing = await db.select().from(userMacros)
+    .where(and(eq(userMacros.discordId, discordId), eq(userMacros.macro, macro)))
+    .limit(1).then((rows: any[]) => rows[0] ?? null);
+
+  if (!existing) {
+    await db.insert(userMacros).values({
+      discordId, macro, status: 'active', source: 'migration', duration,
+      expiresAt: lifetime ? undefined : new Date(Date.now() + (durationMs ?? 0)),
+    });
+    return;
+  }
+
+  if (lifetime) {
+    // Upgrade timed → lifetime; never downgrade lifetime.
+    if (existing.expiresAt === null) return;
+    await db.update(userMacros).set({ expiresAt: null, status: 'active', duration: 'lifetime' })
+      .where(eq(userMacros.id, existing.id));
+    return;
+  }
+
+  // Timed: extend existing expiry (don't downgrade a lifetime owner).
+  if (existing.expiresAt === null) return;
+  const now = Date.now();
+  const base = Math.max(new Date(existing.expiresAt).getTime(), now);
+  await db.update(userMacros).set({ expiresAt: new Date(base + (durationMs ?? 0)), status: 'active' })
+    .where(eq(userMacros.id, existing.id));
+}
 
 const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) => {
   // ── POST /auth/oauth ────────────────────────────────────────────────────────
@@ -132,19 +186,23 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     }
 
     // ── 5. Merge migration claims ───────────────────────────────────────────────
+    // Match by discordId OR by sellauthUsername (case-insensitive). SellAuth
+    // buyers typed a "Discord Name" custom field, so most migration claims only
+    // carry a sellauthUsername, not a discordId. The username match lets a
+    // returning customer's claims auto-resolve on their first sign-in.
     const claims = await db.select().from(migrationClaims)
       .where(and(
-        eq(migrationClaims.discordId, discordId),
+        or(
+          eq(migrationClaims.discordId, discordId),
+          ilike(migrationClaims.sellauthUsername, username.trim()),
+        ),
         eq(migrationClaims.status, 'pending'),
       ));
 
     for (const claim of claims) {
-      await db.insert(userMacros).values({
-        discordId,
-        macro: claim.macro,
-        source: 'migration',
-        duration: claim.duration,
-      }).onConflictDoNothing();
+      // Extend-on-conflict: a returning customer with multiple claims for the
+      // same macro gets them stacked (expiry extended), not dropped.
+      await upsertUserMacroExtendAuth(db, discordId, claim.macro, claim.duration);
       await db.update(migrationClaims).set({ status: 'resolved' })
         .where(eq(migrationClaims.id, claim.id));
     }

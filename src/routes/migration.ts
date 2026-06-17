@@ -1,10 +1,19 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, ilike } from 'drizzle-orm';
 import { users, userMacros, migrationClaims } from '../db/schema.js';
 import { adminAuth } from '../middleware/auth.js';
 
 const BONUS_DAYS = 7;
-const TIMED_ELIGIBILITY_DAYS = 14;
+const TIMED_ELIGIBILITY_DAYS = 30;
+
+// Duration → milliseconds (lifetime = null expiry).
+const DURATION_MS: Record<string, number | null> = {
+  '1d': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  '1m': 30 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000,
+  'lifetime': null,
+};
 
 function calculateMigrationExpiry(duration: string, purchasedAt?: Date): { expiresAt: Date | null; eligible: boolean } {
   const now = new Date();
@@ -13,7 +22,7 @@ function calculateMigrationExpiry(duration: string, purchasedAt?: Date): { expir
     return { expiresAt: null, eligible: true };
   }
 
-  // Timed subscriptions: only eligible if purchased within last 14 days
+  // Timed subscriptions: only eligible if purchased within last 30 days
   const purchaseDate = purchasedAt ?? now;
   const daysSincePurchase = (now.getTime() - purchaseDate.getTime()) / (1000 * 60 * 60 * 24);
 
@@ -22,22 +31,68 @@ function calculateMigrationExpiry(duration: string, purchasedAt?: Date): { expir
   }
 
   // Remaining time from original purchase + 7-day bonus
-  let remainingMs: number;
-  switch (duration) {
-    case '1m':
-      remainingMs = 30 * 24 * 60 * 60 * 1000 - (now.getTime() - purchaseDate.getTime());
-      break;
-    case '7d':
-      remainingMs = 7 * 24 * 60 * 60 * 1000 - (now.getTime() - purchaseDate.getTime());
-      break;
-    default:
-      remainingMs = 30 * 24 * 60 * 60 * 1000 - (now.getTime() - purchaseDate.getTime());
-  }
+  const durationMs = DURATION_MS[duration] ?? (30 * 24 * 60 * 60 * 1000);
+  const remainingMs = durationMs - (now.getTime() - purchaseDate.getTime());
 
   const bonusMs = BONUS_DAYS * 24 * 60 * 60 * 1000;
   const totalMs = Math.max(remainingMs, 0) + bonusMs;
 
   return { expiresAt: new Date(now.getTime() + totalMs), eligible: true };
+}
+
+/**
+ * Upsert a userMacro with extend-on-conflict semantics (mirrors /licenses/redeem).
+ * - If the macro doesn't exist for this user → insert with the given expiry.
+ * - If it exists and is lifetime (expiresAt null) → keep lifetime (no-op).
+ * - If it exists and is timed → extend: newExpiry = max(existingExpiry, now) + durationMs.
+ * Returns true if a row was inserted or extended.
+ */
+async function upsertUserMacroExtend(
+  db: any,
+  discordId: string,
+  macro: string,
+  duration: string,
+  expiresAt: Date | null,
+): Promise<boolean> {
+  const durationMs = DURATION_MS[duration] ?? (30 * 24 * 60 * 60 * 1000);
+  const lifetime = duration === 'lifetime' || expiresAt === null;
+
+  if (lifetime) {
+    // Insert-or-keep-lifetime. If a row exists, ensure it stays lifetime.
+    const existing = await db.select().from(userMacros)
+      .where(and(eq(userMacros.discordId, discordId), eq(userMacros.macro, macro)))
+      .limit(1).then((rows: any[]) => rows[0] ?? null);
+    if (existing) {
+      // Already owned — if it's currently lifetime, nothing to do; if timed, upgrade to lifetime.
+      if (existing.expiresAt === null) return false;
+      await db.update(userMacros).set({ expiresAt: null, status: 'active', duration: 'lifetime' })
+        .where(eq(userMacros.id, existing.id));
+      return true;
+    }
+    await db.insert(userMacros).values({
+      discordId, macro, status: 'active', source: 'migration', duration, expiresAt: undefined,
+    });
+    return true;
+  }
+
+  // Timed: insert-or-extend.
+  const now = Date.now();
+  const existing = await db.select().from(userMacros)
+    .where(and(eq(userMacros.discordId, discordId), eq(userMacros.macro, macro)))
+    .limit(1).then((rows: any[]) => rows[0] ?? null);
+  if (existing) {
+    if (existing.expiresAt === null) return false; // already lifetime, don't downgrade
+    const base = Math.max(new Date(existing.expiresAt).getTime(), now);
+    const newExpiry = new Date(base + durationMs);
+    await db.update(userMacros).set({ expiresAt: newExpiry, status: 'active' })
+      .where(eq(userMacros.id, existing.id));
+    return true;
+  }
+  await db.insert(userMacros).values({
+    discordId, macro, status: 'active', source: 'migration', duration,
+    expiresAt: expiresAt ?? undefined,
+  });
+  return true;
 }
 
 interface ImportPurchaseBody {
@@ -117,9 +172,11 @@ const migrationPlugin: FastifyPluginCallback = async (fastify) => {
         .then((rows: any[]) => rows[0] ?? null);
 
       if (user) {
-        // Check if user already has this macro
+        // Grant (or extend) the macro — stacking extends the existing expiry.
         if (existingMacro) {
-          reply.send({ ok: true, granted: false, reason: 'User already has this macro' });
+          // Use upsert so a second purchase of the same macro extends, not skips.
+          const extended = await upsertUserMacroExtend(db, data.discordId, data.macro, data.duration, expiresAt);
+          reply.send({ ok: true, granted: extended, expiresAt, extended });
           return;
         }
 
@@ -200,25 +257,20 @@ const migrationPlugin: FastifyPluginCallback = async (fastify) => {
       return;
     }
 
-    // Try to match sellauthUsername to existing user
+    // Try to match sellauthUsername to existing user (case-insensitive + trimmed,
+    // since Discord usernames are case-insensitive and buyers may have typed
+    // with different casing in the SellAuth "Discord Name" custom field).
     if (data.sellauthUsername) {
       const user = await db
         .select()
         .from(users)
-        .where(eq(users.username, data.sellauthUsername))
+        .where(ilike(users.username, data.sellauthUsername.trim()))
         .limit(1)
         .then((rows: any[]) => rows[0] ?? null);
 
       if (user) {
-        // Grant macro directly
-        await db.insert(userMacros).values({
-          discordId: user.discordId,
-          macro: data.macro,
-          status: 'active',
-          source: 'migration',
-          duration: data.duration,
-          expiresAt: expiresAt ?? undefined,
-        });
+        // Grant (or extend) the macro — stacking extends the existing expiry.
+        await upsertUserMacroExtend(db, user.discordId, data.macro, data.duration, expiresAt);
 
         reply.send({ ok: true, matched: true, granted: true });
         return;
@@ -235,14 +287,7 @@ const migrationPlugin: FastifyPluginCallback = async (fastify) => {
         .then((rows: any[]) => rows[0] ?? null);
 
       if (user) {
-        await db.insert(userMacros).values({
-          discordId: data.discordId,
-          macro: data.macro,
-          status: 'active',
-          source: 'migration',
-          duration: data.duration,
-          expiresAt: expiresAt ?? undefined,
-        });
+        await upsertUserMacroExtend(db, data.discordId, data.macro, data.duration, expiresAt);
 
         reply.send({ ok: true, matched: true, granted: true });
         return;
