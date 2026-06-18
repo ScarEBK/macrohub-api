@@ -9,8 +9,27 @@ import {
   migrationClaims,
 } from '../db/schema.js';
 
-// ── SKU mapping (mirrors Convex NUMERIC_SKU_LOOKUP) ──────────────────────────
+// ── SKU mapping — REAL SellAuth product/variant IDs (verified from the
+//    SellAuth API 2026-06-17). The old 762/763/764 IDs were stale and didn't
+//    exist in the actual shop. Product names use bold Unicode math symbols
+//    (𝐒𝐩𝐞𝐞𝐝 𝐁𝐨𝐨𝐬𝐭) so we map by stable variant IDs, not names. ────────────
 const NUMERIC_SKU_LOOKUP: Record<string, { macro: string; duration: string }> = {
+  // Speed Boost — product 112404
+  '112404:158298': { macro: 'Speed Boost', duration: 'lifetime' },
+  '112404:929411': { macro: 'Speed Boost', duration: '1m' },
+  '112404:929412': { macro: 'Speed Boost', duration: '7d' },
+  // Glitch Roll — product 89525
+  '89525:146163': { macro: 'Glitch Roll', duration: 'lifetime' },
+  '89525:929422': { macro: 'Glitch Roll', duration: '1m' },
+  '89525:929423': { macro: 'Glitch Roll', duration: '7d' },
+  // Strafe — product 100843
+  '100843:151984': { macro: 'Strafe', duration: 'lifetime' },
+  '100843:929403': { macro: 'Strafe', duration: '1m' },
+  '100843:929404': { macro: 'Strafe', duration: '7d' },
+};
+
+// Legacy IDs kept for backward compat with any old SellAuth webhook configs.
+const LEGACY_SKU_LOOKUP: Record<string, { macro: string; duration: string }> = {
   '762:1368': { macro: 'Speed Boost', duration: '1m' },
   '762:1369': { macro: 'Speed Boost', duration: 'lifetime' },
   '762:1370': { macro: 'Speed Boost', duration: '7d' },
@@ -66,16 +85,11 @@ function resolveSkuMapping(
   productName: string | undefined,
   envSkuMap: Record<string, string> | undefined,
 ): { macro: string; duration: string; isBundle: boolean } | null {
-  // 1. Hardcoded numeric lookup
+  // 1. Hardcoded numeric lookup (real + legacy IDs)
   if (productId != null && variantId != null) {
     const key = `${productId}:${variantId}`;
-    const match = NUMERIC_SKU_LOOKUP[key];
+    const match = NUMERIC_SKU_LOOKUP[key] ?? LEGACY_SKU_LOOKUP[key];
     if (match) {
-      const isBundle = Object.values(NUMERIC_SKU_LOOKUP).filter(
-        (v) => v.macro === match.macro && v.duration === match.duration,
-      ).length > 0 && match.macro === 'Speed Boost' && match.duration === 'lifetime'
-        ? false
-        : false;
       return { ...match, isBundle: false };
     }
   }
@@ -144,7 +158,10 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
 
   // ── POST /sellauth/webhook ──────────────────────────────────────────────
   fastify.post('/sellauth/webhook', async (request, reply) => {
-    const rawBody = typeof request.body === 'string' ? request.body : JSON.stringify(request.body);
+    // Use the raw body captured by the content-type parser (registered in
+    // index.ts). This ensures the HMAC signature is verified over the exact
+    // bytes SellAuth signed, not a re-serialized JSON string.
+    const rawBody = (request as any).rawBody ?? (typeof request.body === 'string' ? request.body : JSON.stringify(request.body));
     const signature = request.headers['x-signature'] as string | undefined;
     const webhookSecret = process.env.SELLAUTH_WEBHOOK_SECRET;
 
@@ -167,7 +184,7 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
       return;
     }
 
-    // Acknowledge notification events
+    // Acknowledge notification events (no fulfillment needed)
     if (body.event?.startsWith('NOTIFICATION')) {
       reply.code(200).send({ ok: true });
       return;
@@ -177,6 +194,22 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
     const productId = body.product_id;
     const variantId = body.variant_id;
     const productName = typeof body.product?.name === 'string' ? body.product.name : undefined;
+
+    // ── Idempotency: if we already processed this order, return the existing
+    //    keys without re-inserting. SellAuth retries webhooks on non-2xx, so
+    //    this prevents duplicate keys + duplicate grants on replay. ─────────
+    if (orderId) {
+      const existing = await db
+        .select()
+        .from(licenseKeys)
+        .where(eq(licenseKeys.sellauthOrderId, orderId));
+
+      if (existing.length > 0) {
+        // Already fulfilled — return existing keys idempotently
+        reply.code(200).send(existing.map((k: any) => k.key).join('\n'));
+        return;
+      }
+    }
 
     // Extract discordId from multiple possible locations
     const discordId =
@@ -224,14 +257,15 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
       for (const macro of BUNDLE_MACROS) {
         const duration = skuResult.duration;
         const key = generateLicenseKey();
-        const expiresAt = calculateExpiry(duration);
 
+        // NOTE: license_keys has NO discordId column (renamed to redeemedBy
+        // in migration). Do not pass discordId on insert — it's set via
+        // redeemedBy when the key is redeemed below.
         await db.insert(licenseKeys).values({
           key,
           status: 'available',
           macro,
           duration,
-          discordId: discordId ?? undefined,
           sellauthOrderId: orderId,
         });
 
@@ -264,7 +298,7 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
               duration: lk.duration,
               expiresAt: expiresAt ?? undefined,
               licenseKeyId: lk.id,
-            });
+            }).onConflictDoNothing();
 
             await db
               .update(licenseKeys)
@@ -275,7 +309,7 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
           // User not found yet — create pending entitlements
           for (const macro of BUNDLE_MACROS) {
             await db.insert(pendingEntitlements).values({
-              discordId: discordId!,
+              discordId: discordId,
               macro,
               duration: skuResult.duration,
               source: 'sellauth',
@@ -284,14 +318,14 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
           }
         }
       } else {
-        // No discordId at all — create pending entitlements with placeholder
+        // No discordId — create migration claims by sellauthUsername
         for (const macro of BUNDLE_MACROS) {
-          await db.insert(pendingEntitlements).values({
-            discordId: sellauthUsername ?? 'unknown',
+          await db.insert(migrationClaims).values({
+            sellauthUsername: sellauthUsername ?? 'unknown',
+            orderId,
             macro,
             duration: skuResult.duration,
-            source: 'sellauth',
-            orderId,
+            status: 'pending',
           });
         }
       }
@@ -310,12 +344,12 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
     const key = generateLicenseKey();
     const expiresAt = calculateExpiry(duration);
 
+    // NOTE: no discordId column on license_keys — use redeemedBy on redemption.
     await db.insert(licenseKeys).values({
       key,
       status: 'available',
       macro,
       duration,
-      discordId: discordId ?? undefined,
       sellauthOrderId: orderId,
     });
 
@@ -328,7 +362,9 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
         .then((rows: any[]) => rows[0] ?? null);
 
       if (user) {
-        // Redeem key and grant userMacro
+        // Redeem key and grant userMacro (onConflictDoNothing — the user
+        // might already own this macro from a prior purchase; the extend
+        // logic in /licenses/redeem handles stacking if they redeem manually)
         const createdKey = await db
           .select()
           .from(licenseKeys)
@@ -344,14 +380,14 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
           duration,
           expiresAt: expiresAt ?? undefined,
           licenseKeyId: createdKey!.id,
-        });
+        }).onConflictDoNothing();
 
         await db
           .update(licenseKeys)
           .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
           .where(eq(licenseKeys.key, key));
       } else {
-        // User not found — create migration claim
+        // User not found — create migration claim (resolves on sign-in)
         await db.insert(migrationClaims).values({
           discordId,
           sellauthUsername: sellauthUsername ?? undefined,

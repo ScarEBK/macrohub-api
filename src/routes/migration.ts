@@ -1,5 +1,5 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, and, ilike } from 'drizzle-orm';
+import { eq, and, sql } from 'drizzle-orm';
 import { users, userMacros, migrationClaims } from '../db/schema.js';
 import { adminAuth } from '../middleware/auth.js';
 
@@ -257,14 +257,16 @@ const migrationPlugin: FastifyPluginCallback = async (fastify) => {
       return;
     }
 
-    // Try to match sellauthUsername to existing user (case-insensitive + trimmed,
-    // since Discord usernames are case-insensitive and buyers may have typed
-    // with different casing in the SellAuth "Discord Name" custom field).
+    // Try to match sellauthUsername to existing user (exact case-insensitive).
+    // Uses lower() = lower() instead of ilike to avoid wildcard injection
+    // (ilike treats % and _ as wildcards, which could match unintended users
+    // if a buyer typed % or _ in the SellAuth "Discord Name" custom field).
     if (data.sellauthUsername) {
+      const trimmedLower = data.sellauthUsername.trim().toLowerCase();
       const user = await db
         .select()
         .from(users)
-        .where(ilike(users.username, data.sellauthUsername.trim()))
+        .where(sql`lower(${users.username}) = ${trimmedLower}`)
         .limit(1)
         .then((rows: any[]) => rows[0] ?? null);
 

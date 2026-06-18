@@ -137,6 +137,25 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       return reply.code(403).send({ error: 'HWID mismatch. Contact support for a reset.' });
     }
 
+    // Ban-bypass guard: even if THIS key isn't banned, check if the user has
+    // any other banned key for the same macro. Without this, a banned user can
+    // buy a fresh key and redeem it to resurrect the revoked macro.
+    if (licenseKey.status !== 'banned') {
+      const [bannedKey] = await db
+        .select({ id: licenseKeys.id })
+        .from(licenseKeys)
+        .where(and(
+          eq(licenseKeys.macro, licenseKey.macro),
+          eq(licenseKeys.status, 'banned'),
+          eq(licenseKeys.redeemedBy, discordId),
+        ))
+        .limit(1);
+
+      if (bannedKey) {
+        return reply.code(403).send({ error: 'KEY_BANNED' });
+      }
+    }
+
     // Mark key as redeemed
     const now = new Date();
     await db
@@ -430,10 +449,19 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const now = new Date();
     const addMs = body.days * 24 * 60 * 60 * 1000;
 
+    // Guard: never downgrade a lifetime macro to timed. Lifetime macros have
+    // expiresAt === null; the old else-branch would set a finite expiry,
+    // destroying perpetual access.
+    if (userMacro.expiresAt === null) {
+      return reply.code(400).send({ error: 'Cannot add time to a lifetime macro — it has no expiry.' });
+    }
+
     let newExpiresAt: Date;
-    if (userMacro.expiresAt && new Date(userMacro.expiresAt) > now) {
+    if (new Date(userMacro.expiresAt) > now) {
+      // Still active — stack the added time onto the existing expiry
       newExpiresAt = new Date(new Date(userMacro.expiresAt).getTime() + addMs);
     } else {
+      // Expired — start fresh from now
       newExpiresAt = new Date(now.getTime() + addMs);
     }
 

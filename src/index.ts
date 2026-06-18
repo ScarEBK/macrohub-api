@@ -51,8 +51,55 @@ await runMigrations(dbUrl);
 
 const app = Fastify({ logger: true });
 
-// ── CORS ────────────────────────────────────────────────────────────────────
-await app.register(cors, { origin: true });
+// ── Raw-body capture for the SellAuth webhook ──────────────────────────────
+// The webhook HMAC signature is computed over the raw request bytes. Fastify's
+// default JSON parser converts the body to an object, losing the original bytes.
+// This content-type parser captures the raw string AND stores it on request.rawBody
+// so the webhook route can verify the HMAC over the exact bytes SellAuth signed.
+app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+  try {
+    const raw = body as string;
+    (req as any).rawBody = raw;
+    const parsed = JSON.parse(raw);
+    done(null, parsed);
+  } catch (err) {
+    done(err as Error, undefined);
+  }
+});
+
+// ── Global error handler — never leak internal error details to clients ────
+// Without this, uncaught errors (DB connection lost, unexpected throws) produce
+// Fastify's default 500 with the raw err.message in the body, which the desktop's
+// parseRestError pipes straight to users. This handler logs the real error
+// server-side and returns a clean message.
+app.setErrorHandler((err: Error & { statusCode?: number }, request, reply) => {
+  request.log.error({ err }, 'Unhandled error');
+  const status = err.statusCode && err.statusCode >= 400 && err.statusCode < 600
+    ? err.statusCode
+    : 500;
+  reply.code(status).send({
+    error: status >= 500
+      ? 'Something went wrong on our end. Please try again in a moment.'
+      : err.message,
+  });
+});
+
+// ── CORS — restrict to known origins (desktop static server + dev) ─────────
+// The desktop app loads from http://127.0.0.1:47891 (packaged) or file://.
+// The API is not meant to be called from arbitrary websites.
+await app.register(cors, {
+  origin: (origin, cb) => {
+    // Allow requests with no Origin header (desktop app, curl, etc.)
+    if (!origin) return cb(null, true);
+    const allowed = [
+      'http://127.0.0.1:47891',
+      'http://localhost:47891',
+      'http://localhost:5173',
+    ];
+    if (allowed.includes(origin)) return cb(null, true);
+    return cb(null, false); // reject unknown origins
+  },
+});
 
 // ── Rate limiting ───────────────────────────────────────────────────────────
 await app.register(rateLimit, {
@@ -84,9 +131,9 @@ await app.register(trialRoutes);
 await app.register(referralRoutes);
 await app.register(sellauthRoutes);
 await app.register(announcementRoutes);
-await app.register(reportRoutes, {
-  prefix: '/reports',
-});
+// NOTE: reportRoutes defines its own /reports/submit + /reports/recent paths.
+// Do NOT prefix — otherwise the effective route becomes /reports/reports/submit (404).
+await app.register(reportRoutes);
 await app.register(adminRoutes);
 await app.register(importSnapshotRoutes);
 await app.register(migrationRoutes);

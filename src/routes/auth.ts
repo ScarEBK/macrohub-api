@@ -1,5 +1,5 @@
 import { FastifyInstance, FastifyPluginCallback } from 'fastify';
-import { eq, and, lt, gt, or, ilike } from 'drizzle-orm';
+import { eq, and, lt, gt, or, sql } from 'drizzle-orm';
 import {
   users,
   desktopSessions,
@@ -186,15 +186,25 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     }
 
     // ── 5. Merge migration claims ───────────────────────────────────────────────
-    // Match by discordId OR by sellauthUsername (case-insensitive). SellAuth
-    // buyers typed a "Discord Name" custom field, so most migration claims only
-    // carry a sellauthUsername, not a discordId. The username match lets a
-    // returning customer's claims auto-resolve on their first sign-in.
+    // Match by discordId OR by sellauthUsername (exact case-insensitive). We use
+    // lower() = lower() instead of ilike() to avoid wildcard injection (% and _
+    // are ilike wildcards that could match unintended claims). This also prevents
+    // username-squatting attacks where an attacker changes their Discord username
+    // to a partial match of a victim's pending claim.
+    //
+    // SECURITY NOTE: username-based claim resolution carries an inherent risk —
+    // if an attacker changes their Discord username to exactly match a buyer's
+    // SellAuth "Discord Name" custom field, they could steal the buyer's macros.
+    // This is accepted as a tradeoff because: (1) Discord usernames are unique
+    // at any point in time, (2) the attacker would need to know the exact name
+    // the buyer typed, (3) claims are typically resolved quickly after purchase.
+    // For high-value claims, prefer discordId-based resolution.
+    const trimmedUsername = username.trim().toLowerCase();
     const claims = await db.select().from(migrationClaims)
       .where(and(
         or(
           eq(migrationClaims.discordId, discordId),
-          ilike(migrationClaims.sellauthUsername, username.trim()),
+          sql`lower(${migrationClaims.sellauthUsername}) = ${trimmedUsername}`,
         ),
         eq(migrationClaims.status, 'pending'),
       ));
