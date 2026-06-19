@@ -195,22 +195,6 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
     const variantId = body.variant_id;
     const productName = typeof body.product?.name === 'string' ? body.product.name : undefined;
 
-    // ── Idempotency: if we already processed this order, return the existing
-    //    keys without re-inserting. SellAuth retries webhooks on non-2xx, so
-    //    this prevents duplicate keys + duplicate grants on replay. ─────────
-    if (orderId) {
-      const existing = await db
-        .select()
-        .from(licenseKeys)
-        .where(eq(licenseKeys.sellauthOrderId, orderId));
-
-      if (existing.length > 0) {
-        // Already fulfilled — return existing keys idempotently
-        reply.code(200).send(existing.map((k: any) => k.key).join('\n'));
-        return;
-      }
-    }
-
     // Extract discordId from multiple possible locations
     const discordId =
       body.custom_fields?.discord_id ||
@@ -250,18 +234,118 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
 
     const { isBundle } = skuResult;
 
-    // ── Bundle order (all 3 macros) ───────────────────────────────────────
-    if (isBundle) {
-      const keys: string[] = [];
+    // ── Fulfillment runs inside a transaction. The unique index on
+    //    license_keys.sellauth_order_id makes concurrent SellAuth webhook
+    //    retries safe: the second delivery's INSERT fails with a unique
+    //    violation, we catch it, re-read the existing keys, and return them
+    //    idempotently — no duplicate keys, no duplicate grants. ────────────
+    const fulfilledKeys = await db.transaction(async (tx) => {
+      // Idempotency: if keys already exist for this order, return them.
+      if (orderId) {
+        const existing = await tx
+          .select()
+          .from(licenseKeys)
+          .where(eq(licenseKeys.sellauthOrderId, orderId));
+        if (existing.length > 0) {
+          return existing.map((k: any) => k.key);
+        }
+      }
 
-      for (const macro of BUNDLE_MACROS) {
-        const duration = skuResult.duration;
+      try {
+        // ── Bundle order (all 3 macros) ─────────────────────────────────────
+        if (isBundle) {
+          const keys: string[] = [];
+
+          for (const macro of BUNDLE_MACROS) {
+            const duration = skuResult.duration;
+            const key = generateLicenseKey();
+
+            await tx.insert(licenseKeys).values({
+              key,
+              status: 'available',
+              macro,
+              duration,
+              sellauthOrderId: orderId,
+            });
+
+            keys.push(key);
+          }
+
+          // If discordId found and user exists, grant all 3 macros and redeem keys
+          if (discordId) {
+            const user = await tx
+              .select()
+              .from(users)
+              .where(eq(users.discordId, discordId))
+              .limit(1)
+              .then((rows: any[]) => rows[0] ?? null);
+
+            if (user) {
+              const createdKeys = await tx
+                .select()
+                .from(licenseKeys)
+                .where(eq(licenseKeys.sellauthOrderId, orderId));
+
+              for (const lk of createdKeys) {
+                const expiresAt = calculateExpiry(lk.duration);
+
+                await tx.insert(userMacros).values({
+                  discordId,
+                  macro: lk.macro,
+                  status: 'active',
+                  source: 'sellauth',
+                  duration: lk.duration,
+                  expiresAt: expiresAt ?? undefined,
+                  licenseKeyId: lk.id,
+                }).onConflictDoNothing();
+
+                await tx
+                  .update(licenseKeys)
+                  .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
+                  .where(eq(licenseKeys.id, lk.id));
+              }
+            } else {
+              // User not found yet — create pending entitlements (orderId
+              // is stored so the idempotency check above de-dupes retries).
+              for (const macro of BUNDLE_MACROS) {
+                await tx.insert(pendingEntitlements).values({
+                  discordId: discordId,
+                  macro,
+                  duration: skuResult.duration,
+                  source: 'sellauth',
+                  orderId,
+                });
+              }
+            }
+          } else {
+            // No discordId — create migration claims by sellauthUsername.
+            // Leave sellauthUsername NULL (not 'unknown') so it can't
+            // accidentally match a Discord user literally named "unknown".
+            for (const macro of BUNDLE_MACROS) {
+              await tx.insert(migrationClaims).values({
+                sellauthUsername: sellauthUsername ?? null,
+                orderId,
+                macro,
+                duration: skuResult.duration,
+                status: 'pending',
+              });
+            }
+          }
+
+          const createdKeys = await tx
+            .select()
+            .from(licenseKeys)
+            .where(eq(licenseKeys.sellauthOrderId, orderId));
+
+          return createdKeys.map((k: any) => k.key);
+        }
+
+        // ── Single product order ───────────────────────────────────────────
+        const { macro, duration } = skuResult;
         const key = generateLicenseKey();
+        const expiresAt = calculateExpiry(duration);
 
-        // NOTE: license_keys has NO discordId column (renamed to redeemedBy
-        // in migration). Do not pass discordId on insert — it's set via
-        // redeemedBy when the key is redeemed below.
-        await db.insert(licenseKeys).values({
+        await tx.insert(licenseKeys).values({
           key,
           status: 'available',
           macro,
@@ -269,155 +353,88 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
           sellauthOrderId: orderId,
         });
 
-        keys.push(key);
-      }
+        if (discordId) {
+          const user = await tx
+            .select()
+            .from(users)
+            .where(eq(users.discordId, discordId))
+            .limit(1)
+            .then((rows: any[]) => rows[0] ?? null);
 
-      // If discordId found and user exists, grant all 3 macros and redeem keys
-      if (discordId) {
-        const user = await db
-          .select()
-          .from(users)
-          .where(eq(users.discordId, discordId))
-          .limit(1)
-          .then((rows: any[]) => rows[0] ?? null);
+          if (user) {
+            const createdKey = await tx
+              .select()
+              .from(licenseKeys)
+              .where(eq(licenseKeys.key, key))
+              .limit(1)
+              .then((rows: any[]) => rows[0]);
 
-        if (user) {
-          const createdKeys = await db
+            await tx.insert(userMacros).values({
+              discordId,
+              macro,
+              status: 'active',
+              source: 'sellauth',
+              duration,
+              expiresAt: expiresAt ?? undefined,
+              licenseKeyId: createdKey!.id,
+            }).onConflictDoNothing();
+
+            await tx
+              .update(licenseKeys)
+              .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
+              .where(eq(licenseKeys.key, key));
+          } else {
+            // User not found — create migration claim (resolves on sign-in)
+            await tx.insert(migrationClaims).values({
+              discordId,
+              sellauthUsername: sellauthUsername ?? undefined,
+              orderId,
+              macro,
+              duration,
+              status: 'pending',
+            });
+          }
+        } else if (sellauthUsername) {
+          // No discordId but has sellauthUsername — create migration claim
+          await tx.insert(migrationClaims).values({
+            sellauthUsername,
+            orderId,
+            macro,
+            duration,
+            status: 'pending',
+          });
+        } else {
+          // No discordId at all — create pending entitlement. Use a non-numeric
+          // sentinel (Discord IDs are all-numeric snowflakes) so it can never
+          // bind to a real user, unlike the previous 'unknown' literal which
+          // could have matched a user literally named "unknown".
+          await tx.insert(pendingEntitlements).values({
+            discordId: '__no_discord__',
+            macro,
+            duration,
+            source: 'sellauth',
+            orderId,
+          });
+        }
+
+        return [key];
+      } catch (err: any) {
+        // Unique violation on sellauth_order_id = a concurrent retry already
+        // inserted keys for this order. Re-read them and return idempotently.
+        if (orderId && /unique|duplicate|23505/i.test(err?.message ?? String(err))) {
+          const existing = await tx
             .select()
             .from(licenseKeys)
             .where(eq(licenseKeys.sellauthOrderId, orderId));
-
-          for (const lk of createdKeys) {
-            const expiresAt = calculateExpiry(lk.duration);
-
-            await db.insert(userMacros).values({
-              discordId,
-              macro: lk.macro,
-              status: 'active',
-              source: 'sellauth',
-              duration: lk.duration,
-              expiresAt: expiresAt ?? undefined,
-              licenseKeyId: lk.id,
-            }).onConflictDoNothing();
-
-            await db
-              .update(licenseKeys)
-              .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
-              .where(eq(licenseKeys.id, lk.id));
-          }
-        } else {
-          // User not found yet — create pending entitlements
-          for (const macro of BUNDLE_MACROS) {
-            await db.insert(pendingEntitlements).values({
-              discordId: discordId,
-              macro,
-              duration: skuResult.duration,
-              source: 'sellauth',
-              orderId,
-            });
+          if (existing.length > 0) {
+            return existing.map((k: any) => k.key);
           }
         }
-      } else {
-        // No discordId — create migration claims by sellauthUsername
-        for (const macro of BUNDLE_MACROS) {
-          await db.insert(migrationClaims).values({
-            sellauthUsername: sellauthUsername ?? 'unknown',
-            orderId,
-            macro,
-            duration: skuResult.duration,
-            status: 'pending',
-          });
-        }
+        throw err;
       }
-
-      const createdKeys = await db
-        .select()
-        .from(licenseKeys)
-        .where(eq(licenseKeys.sellauthOrderId, orderId));
-
-      reply.code(200).send(createdKeys.map((k: any) => k.key).join('\n'));
-      return;
-    }
-
-    // ── Single product order ──────────────────────────────────────────────
-    const { macro, duration } = skuResult;
-    const key = generateLicenseKey();
-    const expiresAt = calculateExpiry(duration);
-
-    // NOTE: no discordId column on license_keys — use redeemedBy on redemption.
-    await db.insert(licenseKeys).values({
-      key,
-      status: 'available',
-      macro,
-      duration,
-      sellauthOrderId: orderId,
     });
 
-    if (discordId) {
-      const user = await db
-        .select()
-        .from(users)
-        .where(eq(users.discordId, discordId))
-        .limit(1)
-        .then((rows: any[]) => rows[0] ?? null);
-
-      if (user) {
-        // Redeem key and grant userMacro (onConflictDoNothing — the user
-        // might already own this macro from a prior purchase; the extend
-        // logic in /licenses/redeem handles stacking if they redeem manually)
-        const createdKey = await db
-          .select()
-          .from(licenseKeys)
-          .where(eq(licenseKeys.key, key))
-          .limit(1)
-          .then((rows: any[]) => rows[0]);
-
-        await db.insert(userMacros).values({
-          discordId,
-          macro,
-          status: 'active',
-          source: 'sellauth',
-          duration,
-          expiresAt: expiresAt ?? undefined,
-          licenseKeyId: createdKey!.id,
-        }).onConflictDoNothing();
-
-        await db
-          .update(licenseKeys)
-          .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
-          .where(eq(licenseKeys.key, key));
-      } else {
-        // User not found — create migration claim (resolves on sign-in)
-        await db.insert(migrationClaims).values({
-          discordId,
-          sellauthUsername: sellauthUsername ?? undefined,
-          orderId,
-          macro,
-          duration,
-          status: 'pending',
-        });
-      }
-    } else if (sellauthUsername) {
-      // No discordId but has sellauthUsername — create migration claim
-      await db.insert(migrationClaims).values({
-        sellauthUsername,
-        orderId,
-        macro,
-        duration,
-        status: 'pending',
-      });
-    } else {
-      // No discordId at all — create pending entitlement
-      await db.insert(pendingEntitlements).values({
-        discordId: 'unknown',
-        macro,
-        duration,
-        source: 'sellauth',
-        orderId,
-      });
-    }
-
-    reply.code(200).send(key);
+    reply.code(200).send(fulfilledKeys.join('\n'));
   });
 };
 

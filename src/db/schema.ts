@@ -94,7 +94,10 @@ export const licenseKeys = pgTable(
   (table) => [
     uniqueIndex("license_keys_key_unique").on(table.key),
     index("license_keys_status_idx").on(table.status),
-    index("license_keys_sellauth_order_id_idx").on(table.sellauthOrderId),
+    // Unique (not just an index) so concurrent SellAuth webhook retries can't
+    // create duplicate keys for the same order. NULLs are treated as distinct
+    // by Postgres, so manual/admin keys with no orderId never collide.
+    uniqueIndex("license_keys_sellauth_order_id_unique").on(table.sellauthOrderId),
   ],
 );
 

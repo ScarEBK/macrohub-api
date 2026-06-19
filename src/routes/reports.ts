@@ -7,6 +7,29 @@ const MAX_MESSAGE_LENGTH = 2000;
 const MAX_STACK_LENGTH = 4000;
 const MAX_CONTEXT_LENGTH = 2000;
 
+/**
+ * Escape user-controlled text before embedding it in a Discord webhook
+ * embed. The previous version dropped the raw message/stack/context into
+ * triple-backtick code fences, so a user could include ``` in their report
+ * to break out of the fence and inject arbitrary Discord markdown (mentions,
+ * formatting, links). Backslash-escape the backticks so the fence can't be
+ * closed early; also neutralize other markdown metacharacters used outside
+ * the fences (the title + userLabel).
+ */
+function escapeDiscordMarkdown(text: string): string {
+  // Zero-width-escape the backtick so a user can't close the ``` fence.
+  return text.replace(/`/g, "\\`");
+}
+
+function sanitizeInline(text: string): string {
+  // For inline (non-fenced) fields: escape backticks AND the markdown
+  // metacharacters that matter inline — mentions (@), bold/italic (* _),
+  // links [], and the zero-width space that breaks mention detection.
+  return text
+    .replace(/[`*_\[\]@\\]/g, (m) => `\\${m}`)
+    .replace(/\u200B/g, "");
+}
+
 interface SubmitBody {
   severity: 'error' | 'warning';
   message: string;
@@ -94,25 +117,27 @@ const reportPlugin: FastifyPluginCallback = async (fastify) => {
     const webhookUrl = process.env.DISCORD_ERROR_WEBHOOK_URL;
     if (webhookUrl) {
       try {
-        const userLabel = discordUsername
-          ? `${discordUsername} (\`${discordId}\`)`
-          : discordId
-            ? `\`${discordId}\``
+        const safeDiscordId = discordId ? sanitizeInline(discordId) : '';
+        const safeDiscordUsername = discordUsername ? sanitizeInline(discordUsername) : '';
+        const userLabel = safeDiscordUsername
+          ? `${safeDiscordUsername} (\`${safeDiscordId}\`)`
+          : safeDiscordId
+            ? `\`${safeDiscordId}\``
             : 'unsigned';
 
         const lines: string[] = [
           `**User:** ${userLabel}`,
-          `**App:** v${appVersion ?? 'unknown'}`,
-          `**Route:** ${route ?? '—'}`,
-          `**HWID:** \`${hwidPrefix ?? 'unknown'}…\``,
+          `**App:** v${sanitizeInline(appVersion ?? 'unknown')}`,
+          `**Route:** ${sanitizeInline(route ?? '—')}`,
+          `**HWID:** \`${sanitizeInline(hwidPrefix ?? 'unknown')}…\``,
           '',
-          `\`\`\`\n${truncatedMessage}\n\`\`\``,
+          `\`\`\`\n${escapeDiscordMarkdown(truncatedMessage)}\n\`\`\``,
         ];
         if (truncatedContext) {
-          lines.push('', '**Context:**', `\`\`\`\n${truncatedContext}\n\`\`\``);
+          lines.push('', '**Context:**', `\`\`\`\n${escapeDiscordMarkdown(truncatedContext)}\n\`\`\``);
         }
         if (truncatedStack) {
-          lines.push('', '**Stack:**', `\`\`\`\n${truncatedStack.slice(0, 1500)}\n\`\`\``);
+          lines.push('', '**Stack:**', `\`\`\`\n${escapeDiscordMarkdown(truncatedStack.slice(0, 1500))}\n\`\`\``);
         }
 
         await fetch(webhookUrl, {
@@ -120,7 +145,7 @@ const reportPlugin: FastifyPluginCallback = async (fastify) => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             embeds: [{
-              title: `MacroHub ${data.severity}: ${truncatedMessage.slice(0, 80)}`,
+              title: `MacroHub ${data.severity}: ${sanitizeInline(truncatedMessage.slice(0, 80))}`,
               description: lines.join('\n').slice(0, 4000),
               color: data.severity === 'error' ? 0xed4245 : 0xfaa61a,
               timestamp: new Date().toISOString(),

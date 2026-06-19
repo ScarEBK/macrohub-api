@@ -103,6 +103,11 @@ interface ImportPurchaseBody {
   duration: string;
   sellauthProductId?: number | string;
   sellauthVariantId?: number | string;
+  // purchasedAt (ISO string or epoch ms) — when the SellAuth order was placed.
+  // The previous version omitted this field and called calculateMigrationExpiry
+  // without it, so every timed claim was treated as just-purchased (full
+  // duration + 7-day bonus from "now"), ignoring the 30-day eligibility cutoff.
+  purchasedAt?: string | number;
 }
 
 interface ImportRowBody {
@@ -155,7 +160,14 @@ const migrationPlugin: FastifyPluginCallback = async (fastify) => {
       .limit(1)
       .then((rows: any[]) => rows[0] ?? null);
 
-    const { expiresAt, eligible } = calculateMigrationExpiry(data.duration);
+    // Parse purchasedAt the same way import-row does, then pass it through so
+    // the 30-day eligibility cutoff actually applies (lifetime is always
+    // eligible; timed subs older than 30 days are skipped with a 7-day bonus
+    // for those within the window).
+    const purchasedAt = data.purchasedAt
+      ? new Date(typeof data.purchasedAt === 'number' ? data.purchasedAt : String(data.purchasedAt))
+      : new Date();
+    const { expiresAt, eligible } = calculateMigrationExpiry(data.duration, purchasedAt);
 
     if (!eligible) {
       reply.send({ ok: true, granted: false, reason: 'Purchase too old for migration' });

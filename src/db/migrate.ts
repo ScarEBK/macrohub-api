@@ -119,6 +119,11 @@ const MIGRATIONS = [
   { name: 'alter announcements.dismissible default to true',
     sql: `ALTER TABLE announcements ALTER COLUMN dismissible SET DEFAULT TRUE;`,
   },
+  // 8. license_keys: make sellauth_order_id unique to prevent duplicate
+  // fulfillment on concurrent SellAuth webhook retries.
+  { name: 'create unique index license_keys_sellauth_order_id_unique',
+    sql: `CREATE UNIQUE INDEX IF NOT EXISTS license_keys_sellauth_order_id_unique ON license_keys (sellauth_order_id);`,
+  },
 ];
 
 export async function runMigrations(dbUrl: string) {

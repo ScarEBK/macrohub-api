@@ -157,7 +157,12 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
           await db.update(users).set({ hwid, hwidResetAllowed: false, hwidResetCount: newCount }).where(eq(users.discordId, discordId));
           user = { ...user, hwid, hwidResetAllowed: false, hwidResetCount: newCount };
         } else {
-          return reply.code(403).send({ error: 'HWID_MISMATCH' });
+          // Signed in on a new PC with no reset grant. Return a distinct code
+          // so the desktop can show a clear "contact support to transfer"
+          // message instead of a generic sign-in failure. The user must
+          // request an HWID reset via the Discord bot (`/macrohub reset-hwid`),
+          // which sets `hwidResetAllowed` and lets the next sign-in rebind.
+          return reply.code(403).send({ error: 'HWID_REBIND_AVAILABLE' });
         }
       } else if (!storedHwid) {
         await db.update(users).set({ hwid }).where(eq(users.discordId, discordId));
@@ -176,12 +181,12 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
         continue;
       }
 
-      await db.insert(userMacros).values({
-        discordId,
-        macro: ent.macro,
-        source: ent.source,
-        duration: ent.duration,
-      }).onConflictDoNothing();
+      // Stack: a repeat buyer of the same macro should have their duration
+      // extended, not silently dropped. The previous version used
+      // onConflictDoNothing which dropped the grant if the user already owned
+      // the macro — inconsistent with /licenses/redeem and the migration-claim
+      // merge, both of which stack via upsertUserMacroExtendAuth.
+      await upsertUserMacroExtendAuth(db, discordId, ent.macro, ent.duration);
       await db.delete(pendingEntitlements).where(eq(pendingEntitlements.id, ent.id));
     }
 
@@ -304,7 +309,10 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
   });
 
   // ── GET /auth/hwid-check ─────────────────────────────────────────────────────
-  app.get<{ Querystring: { hwid?: string } }>('/auth/hwid-check', async (request, reply) => {
+  // Admin-only: previously unauthenticated, which let anyone enumerate whether
+  // a HWID was bound and to which Discord ID. Restricted to admins now; the
+  // desktop doesn't use this endpoint (it learns HWID state via /auth/oauth).
+  app.get<{ Querystring: { hwid?: string } }>('/auth/hwid-check', { preHandler: [adminAuth] }, async (request, reply) => {
     const hwid = request.query.hwid;
 
     if (!hwid) {
@@ -342,7 +350,17 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     const { discordId } = request.body;
     const { db } = request.server;
 
-    await db.update(users).set({ hwid: null })
+    // Mirror the legacy Convex clearHwidForBot: null the stored HWID AND set
+    // hwidResetAllowed = true so the user's next sign-in on the new machine
+    // rebinds cleanly (the stored-hwid is null, so the /auth/oauth "no stored
+    // HWID" branch binds the fresh one directly; the reset flag is also
+    // consumed defensively if a stale session tries a redeem first). The
+    // previous version only cleared hwid, so the user had to fully sign out
+    // and back in for the reset to take effect.
+    await db.update(users).set({
+      hwid: null,
+      hwidResetAllowed: true,
+    })
       .where(eq(users.discordId, discordId));
 
     return reply.send({ ok: true });

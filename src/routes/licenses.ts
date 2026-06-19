@@ -134,7 +134,10 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .limit(1);
 
     if (user && user.hwid && user.hwid !== hwid && !user.hwidResetAllowed) {
-      return reply.code(403).send({ error: 'HWID mismatch. Contact support for a reset.' });
+      // Same rebind-required condition as /auth/oauth. Use the shared code so
+      // the desktop maps it to the clear "contact support to transfer" message
+      // rather than a generic redeem failure.
+      return reply.code(403).send({ error: 'HWID_REBIND_AVAILABLE' });
     }
 
     // Ban-bypass guard: even if THIS key isn't banned, check if the user has
@@ -186,6 +189,18 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     let expiresAtMs: number | null;
 
     if (existingMacro) {
+      // If the existing macro was REVOKED (non-banned), redeeming a fresh key
+      // re-activates it — a fresh purchase should revive access. This is
+      // intentional, but it bypasses the ban-bypass guard (which only catches
+      // *banned* keys), so log it to admin_logs for auditability.
+      if (existingMacro.status === 'revoked') {
+        await db.insert(adminLogs).values({
+          action: 'license_redeem_reactivated_revoked',
+          actorDiscordId: discordId,
+          targetDiscordId: discordId,
+          details: { macro, key: licenseKey.key, previousStatus: 'revoked' },
+        });
+      }
       if (durationMs === null) {
         // Lifetime — no expiry
         expiresAt = null;

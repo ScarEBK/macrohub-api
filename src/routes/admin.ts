@@ -1,6 +1,6 @@
 import { FastifyPluginCallback } from 'fastify';
 import { eq, count, sql } from 'drizzle-orm';
-import { users, userMacros, licenseKeys, referralEvents, referralCodes, trials } from '../db/schema.js';
+import { users, userMacros, licenseKeys, referralEvents, referralCodes, trials, trialRegistrations } from '../db/schema.js';
 import { adminAuth } from '../middleware/auth.js';
 
 const adminRoutes: FastifyPluginCallback = (app, _opts, done) => {
@@ -68,7 +68,15 @@ const adminRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .from(licenseKeys)
       .where(eq(licenseKeys.status, 'redeemed'));
 
+    // Count trials from the active trial_registrations table (the one
+    // /trials/claim actually writes to). The previous version counted the
+    // legacy `trials` table which is only populated by the Convex snapshot
+    // import, so the stat was stale. Report both for completeness.
     const [trialsClaimed] = await db
+      .select({ count: count() })
+      .from(trialRegistrations);
+
+    const [legacyTrials] = await db
       .select({ count: count() })
       .from(trials);
 
@@ -82,6 +90,7 @@ const adminRoutes: FastifyPluginCallback = (app, _opts, done) => {
       keysGenerated: keysGenerated.count,
       keysRedeemed: keysRedeemed.count,
       trialsClaimed: trialsClaimed.count,
+      legacyTrials: legacyTrials.count,
       referralEvents: referralEventCount.count,
     });
   });

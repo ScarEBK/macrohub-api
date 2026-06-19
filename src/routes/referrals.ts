@@ -11,20 +11,24 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const { db } = request.server;
 
     // Look up or create referral code
-    const [referralCode] = await db
+    const [existingCode] = await db
       .select({ code: referralCodes.code })
       .from(referralCodes)
       .where(eq(referralCodes.discordId, discordId))
       .limit(1);
 
-    if (!referralCode) {
-      const code = generateReferralCode(discordId);
+    // Use the code that was actually inserted (not a freshly-generated one
+    // that differs from what's in the DB — the previous version generated
+    // `code`, inserted it, then returned a DIFFERENT generated code, so the
+    // user saw a referral code that didn't match what was stored).
+    const code = existingCode?.code ?? generateReferralCode(discordId);
+    if (!existingCode) {
       await db
         .insert(referralCodes)
         .values({ discordId, code });
     }
 
-    const codeResult = referralCode ?? { code: generateReferralCode(discordId) };
+    const codeResult = { code };
 
     // Count install referral events (last 30 days, max 10/month for reward)
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
@@ -178,7 +182,12 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     for (const macro of activeMacros) {
       if (macro.expiresAt) {
-        const newExpiry = new Date(macro.expiresAt.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
+        // Defensive wrap: drizzle/postgres-js may return expiresAt as a string
+        // instead of a Date depending on serialization config. new Date(...)
+        // accepts both and the previous raw .getTime() would throw TypeError
+        // on a string, 500ing the whole reward call.
+        const currentExpiry = new Date(macro.expiresAt as any);
+        const newExpiry = new Date(currentExpiry.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
         await db
           .update(userMacros)
           .set({ expiresAt: newExpiry, updatedAt: new Date() })
@@ -257,7 +266,8 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     for (const activeMacro of activeMacros) {
       if (activeMacro.expiresAt) {
-        const newExpiry = new Date(activeMacro.expiresAt.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
+        const currentExpiry = new Date(activeMacro.expiresAt as any);
+        const newExpiry = new Date(currentExpiry.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
         await db
           .update(userMacros)
           .set({ expiresAt: newExpiry, updatedAt: new Date() })

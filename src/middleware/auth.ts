@@ -75,10 +75,23 @@ export async function desktopSessionAuth(request: FastifyRequest, reply: Fastify
       .limit(1);
 
     if (user?.hwidResetAllowed) {
+      // Migrate the session row's HWID AND consume the reset grant on the
+      // user row, mirroring /auth/oauth (which sets hwidResetAllowed=false +
+      // bumps hwidResetCount). The previous version only updated the session
+      // row and left the grant live, letting the user HWID-migrate repeatedly
+      // within one session lifetime.
       await db
         .update(desktopSessions)
         .set({ hwid })
         .where(eq(desktopSessions.token, token));
+      await db
+        .update(users)
+        .set({
+          hwid,
+          hwidResetAllowed: false,
+          hwidResetCount: (user as any).hwidResetCount ? (user as any).hwidResetCount + 1 : 1,
+        })
+        .where(eq(users.discordId, session.discordId));
     } else {
       reply.code(401).send({ error: 'HWID mismatch' });
       return;

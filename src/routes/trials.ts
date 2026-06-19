@@ -94,11 +94,19 @@ const trialRoutes: FastifyPluginCallback = (app, _opts, done) => {
     const startedAt = new Date();
     const expiresAt = new Date(startedAt.getTime() + TRIAL_MS);
 
-    // Create trial registration
+    // Create trial registration — persist the collected PII (email,
+    // interestReason, discordUsername) so the validation above isn't dead.
+    // The columns already exist in the schema; the previous insert omitted
+    // them, so the data was validated then discarded.
     await db.insert(trialRegistrations).values({
       discordId,
+      discordUsername: body.discordUsername ?? null,
+      email,
+      interestReason,
       hwid,
       macro,
+      startedAt,
+      expiresAt,
     });
 
     // Create or update user macro
