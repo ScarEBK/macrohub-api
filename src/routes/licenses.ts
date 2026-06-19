@@ -116,7 +116,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     if (licenseKey.status === 'banned') {
-      return reply.code(403).send({ error: 'KEY_BANNED' });
+      return reply.code(403).send({ error: 'KEY_BANNED: This license key has been banned.' });
     }
 
     if (licenseKey.status === 'redeemed') {
@@ -155,7 +155,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
         .limit(1);
 
       if (bannedKey) {
-        return reply.code(403).send({ error: 'KEY_BANNED' });
+        return reply.code(403).send({ error: 'KEY_BANNED: This account is restricted from this macro because of a previous banned key.' });
       }
     }
 
