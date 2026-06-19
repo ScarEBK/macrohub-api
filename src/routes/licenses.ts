@@ -140,127 +140,123 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       return reply.code(403).send({ error: 'HWID_REBIND_AVAILABLE' });
     }
 
-    // Ban-bypass guard: even if THIS key isn't banned, check if the user has
-    // any other banned key for the same macro. Without this, a banned user can
-    // buy a fresh key and redeem it to resurrect the revoked macro.
-    if (licenseKey.status !== 'banned') {
-      const [bannedKey] = await db
-        .select({ id: licenseKeys.id })
-        .from(licenseKeys)
+    // Ban-bypass guard removed (2026-06-19): the product owner wants a banned
+    // user to be able to buy a fresh key and redeem it. The per-key ban check
+    // above (status === 'banned') still prevents the banned key itself from
+    // being reused. We now compute the new expiry from now when reactivating a
+    // revoked row so leftover time is not stacked onto the new purchase.
+
+    // Wrap the write path in a transaction so concurrent redeems of two keys for
+    // the same macro cannot race on the same user_macros row.
+    const now = new Date();
+    const result = await db.transaction(async (tx) => {
+      // Mark key as redeemed
+      await tx
+        .update(licenseKeys)
+        .set({
+          status: 'redeemed',
+          redeemedBy: discordId,
+          redeemedAt: now,
+        })
+        .where(eq(licenseKeys.id, licenseKey.id));
+
+      // Calculate duration
+      const durationMs = DURATION_MS[licenseKey.duration];
+      const macro = licenseKey.macro;
+      const duration = licenseKey.duration;
+
+      // Upsert userMacro: if active macro exists, extend; otherwise create new.
+      // When the existing row is revoked, start the new duration from now (do
+      // not carry over leftover time from the revoked entitlement).
+      const [existingMacro] = await tx
+        .select()
+        .from(userMacros)
         .where(and(
-          eq(licenseKeys.macro, licenseKey.macro),
-          eq(licenseKeys.status, 'banned'),
-          eq(licenseKeys.redeemedBy, discordId),
+          eq(userMacros.discordId, discordId),
+          eq(userMacros.macro, macro),
         ))
         .limit(1);
 
-      if (bannedKey) {
-        return reply.code(403).send({ error: 'KEY_BANNED: This account is restricted from this macro because of a previous banned key.' });
+      let expiresAt: Date | null;
+      let expiresAtMs: number | null;
+
+      if (existingMacro) {
+        if (existingMacro.status === 'revoked') {
+          // Fresh purchase re-activates a revoked macro. Log it, but compute
+          // the new duration from now so the user does not get leftover time
+          // from the revoked entitlement stacked on top of the new key.
+          await tx.insert(adminLogs).values({
+            action: 'license_redeem_reactivated_revoked',
+            actorDiscordId: discordId,
+            targetDiscordId: discordId,
+            details: { macro, key: licenseKey.key, previousStatus: 'revoked' },
+          });
+        }
+        if (durationMs === null) {
+          expiresAt = null;
+          expiresAtMs = null;
+        } else {
+          const baseDate =
+            existingMacro.status === 'active' &&
+            existingMacro.expiresAt &&
+            new Date(existingMacro.expiresAt) > now
+              ? new Date(existingMacro.expiresAt)
+              : now;
+          expiresAt = new Date(baseDate.getTime() + durationMs);
+          expiresAtMs = expiresAt.getTime();
+        }
+
+        await tx
+          .update(userMacros)
+          .set({
+            status: 'active',
+            source: 'redeem',
+            duration,
+            expiresAt,
+            licenseKeyId: licenseKey.id,
+            updatedAt: now,
+          })
+          .where(eq(userMacros.id, existingMacro.id));
+      } else {
+        if (durationMs === null) {
+          expiresAt = null;
+          expiresAtMs = null;
+        } else {
+          expiresAt = new Date(now.getTime() + durationMs);
+          expiresAtMs = expiresAt.getTime();
+        }
+
+        await tx
+          .insert(userMacros)
+          .values({
+            discordId,
+            macro,
+            status: 'active',
+            source: 'redeem',
+            duration,
+            expiresAt,
+            licenseKeyId: licenseKey.id,
+          });
       }
-    }
 
-    // Mark key as redeemed
-    const now = new Date();
-    await db
-      .update(licenseKeys)
-      .set({
-        status: 'redeemed',
-        redeemedBy: discordId,
-        redeemedAt: now,
-      })
-      .where(eq(licenseKeys.id, licenseKey.id));
-
-    // Calculate duration
-    const durationMs = DURATION_MS[licenseKey.duration];
-    const macro = licenseKey.macro;
-    const duration = licenseKey.duration;
-
-    // Upsert userMacro: if active macro exists, extend; otherwise create new
-    const [existingMacro] = await db
-      .select()
-      .from(userMacros)
-      .where(and(
-        eq(userMacros.discordId, discordId),
-        eq(userMacros.macro, macro),
-      ))
-      .limit(1);
-
-    let expiresAt: Date | null;
-    let expiresAtMs: number | null;
-
-    if (existingMacro) {
-      // If the existing macro was REVOKED (non-banned), redeeming a fresh key
-      // re-activates it — a fresh purchase should revive access. This is
-      // intentional, but it bypasses the ban-bypass guard (which only catches
-      // *banned* keys), so log it to admin_logs for auditability.
-      if (existingMacro.status === 'revoked') {
-        await db.insert(adminLogs).values({
-          action: 'license_redeem_reactivated_revoked',
+      // Create adminLog entry
+      await tx
+        .insert(adminLogs)
+        .values({
+          action: 'license_redeem',
           actorDiscordId: discordId,
           targetDiscordId: discordId,
-          details: { macro, key: licenseKey.key, previousStatus: 'revoked' },
+          details: JSON.stringify({ key: licenseKey.key, macro, duration }),
         });
-      }
-      if (durationMs === null) {
-        // Lifetime — no expiry
-        expiresAt = null;
-        expiresAtMs = null;
-      } else {
-        const baseDate = existingMacro.expiresAt && new Date(existingMacro.expiresAt) > now
-          ? new Date(existingMacro.expiresAt)
-          : now;
-        expiresAt = new Date(baseDate.getTime() + durationMs);
-        expiresAtMs = expiresAt.getTime();
-      }
 
-      await db
-        .update(userMacros)
-        .set({
-          status: 'active',
-          source: 'redeem',
-          duration,
-          expiresAt,
-          licenseKeyId: licenseKey.id,
-          updatedAt: now,
-        })
-        .where(eq(userMacros.id, existingMacro.id));
-    } else {
-      if (durationMs === null) {
-        expiresAt = null;
-        expiresAtMs = null;
-      } else {
-        expiresAt = new Date(now.getTime() + durationMs);
-        expiresAtMs = expiresAt.getTime();
-      }
-
-      await db
-        .insert(userMacros)
-        .values({
-          discordId,
-          macro,
-          status: 'active',
-          source: 'redeem',
-          duration,
-          expiresAt,
-          licenseKeyId: licenseKey.id,
-        });
-    }
-
-    // Create adminLog entry
-    await db
-      .insert(adminLogs)
-      .values({
-        action: 'license_redeem',
-        actorDiscordId: discordId,
-        targetDiscordId: discordId,
-        details: JSON.stringify({ key: licenseKey.key, macro, duration }),
-      });
+      return { macro, duration, expiresAtMs };
+    });
 
     return reply.send({
       success: true,
-      macro,
-      duration,
-      expiresAt: expiresAtMs,
+      macro: result.macro,
+      duration: result.duration,
+      expiresAt: result.expiresAtMs,
     });
   });
 

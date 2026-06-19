@@ -62,9 +62,12 @@ async function upsertUserMacroExtendAuth(
   }
 
   // Timed: extend existing expiry (don't downgrade a lifetime owner).
+  // If the existing row is revoked, start from now so a reactivated user does
+  // not get leftover revoked time stacked onto the new grant.
   if (existing.expiresAt === null) return;
   const now = Date.now();
-  const base = Math.max(new Date(existing.expiresAt).getTime(), now);
+  const existingExpires = new Date(existing.expiresAt).getTime();
+  const base = existing.status === 'active' ? Math.max(existingExpires, now) : now;
   await db.update(userMacros).set({ expiresAt: new Date(base + (durationMs ?? 0)), status: 'active' })
     .where(eq(userMacros.id, existing.id));
 }
