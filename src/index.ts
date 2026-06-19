@@ -103,7 +103,14 @@ await app.register(cors, {
 
 // ── Rate limiting ───────────────────────────────────────────────────────────
 await app.register(rateLimit, {
-  max: 5000,
+  // Raised from 5000 to 20000/min. The Railway proxy pools all client
+  // traffic through a small set of egress IPs, so the IP-keyed bucket is
+  // shared across many users. 5000/min was tight even for legitimate polling
+  // (every desktop checks /licenses/access every 3 min + on events), and once
+  // the B1 fix made the access check actually reach the server, a burst of
+  // simultaneous client updates could trip the limiter and 429 legitimate
+  // redeems. 20000/min gives comfortable headroom while still blocking abuse.
+  max: 20000,
   timeWindow: '1 minute',
   keyGenerator: (request) => {
     // Skip rate limiting for admin requests (already auth'd by x-admin-secret)
