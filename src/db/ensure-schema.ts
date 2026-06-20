@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
   hwid_reset_allowed BOOLEAN DEFAULT FALSE,
   hwid_reset_count INTEGER DEFAULT 0,
   referred_by_discord_id VARCHAR(255),
+  banned_macros JSONB DEFAULT '[]'::jsonb,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   last_seen_at TIMESTAMP DEFAULT NOW()

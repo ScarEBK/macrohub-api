@@ -6,6 +6,7 @@ import postgres from 'postgres';
 import * as schema from './db/schema.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSchema } from './db/ensure-schema.js';
+import { timingSafeEqual } from './lib/crypto.js';
 
 import authRoutes from './routes/auth.js';
 import licenseRoutes from './routes/licenses.js';
@@ -113,10 +114,21 @@ await app.register(rateLimit, {
   max: 20000,
   timeWindow: '1 minute',
   keyGenerator: (request) => {
-    // Skip rate limiting for admin requests (already auth'd by x-admin-secret)
-    const adminSecret = request.headers['x-admin-secret'];
-    if (typeof adminSecret === 'string' && adminSecret.length > 0) {
-      return `admin:${request.ip}`;
+    // M-7 fix (audit 2026-06-19): previously any non-empty x-admin-secret
+    // header (even a wrong one) yielded a private admin:<ip> bucket, giving
+    // an attacker a dedicated 20k/min bucket separate from the shared IP
+    // pool. Now only verified admin requests get the private bucket —
+    // verify the secret with a timing-safe compare before keying. A wrong
+    // secret falls through to the shared IP bucket (the adminAuth preHandler
+    // will still 401 it downstream).
+    const provided = request.headers['x-admin-secret'];
+    const expected = process.env.ADMIN_SECRET || process.env.CONVEX_ADMIN_SECRET;
+    if (typeof provided === 'string' && typeof expected === 'string' && expected.length > 0) {
+      // Cheap length gate then constant-time compare. Both sides are
+      // app-controlled lengths so the length gate doesn't leak timing.
+      if (provided.length === expected.length && timingSafeEqual(provided, expected)) {
+        return `admin:${request.ip}`;
+      }
     }
     return request.ip;
   },

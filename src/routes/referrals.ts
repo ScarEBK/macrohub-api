@@ -4,6 +4,141 @@ import { desktopSessionAuth, AuthenticatedRequest, adminAuth } from '../middlewa
 import { generateReferralCode } from '../lib/crypto.js';
 import { referralCodes, referralEvents, userMacros } from '../db/schema.js';
 
+// ──────────────────────────────────────────────────────────────────────────
+// C-2 fix (audit 2026-06-19): extracted reward-grant helpers.
+//
+// Previously apply-install-reward and apply-purchase-reward were admin-only
+// HTTP endpoints that NOTHING called — the OAuth signup inserted a referral
+// event row but never granted days, and the SellAuth webhook never invoked
+// the purchase reward. The entire referral reward system was dead. These
+// helpers contain the same core logic, exported so the signup + webhook
+// flows can call them directly. The HTTP routes below remain for admin
+// manual-trigger / debugging.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Grant the install referral reward: +3 days to each of the referrer's active
+ * timed macros, and record the install event (deduped by referrer+referred).
+ * Safe to call from the OAuth signup flow. No-ops if the referrer has no
+ * active macros or the install was already recorded.
+ */
+export async function grantInstallReward(
+  db: any,
+  referrerDiscordId: string,
+  referredDiscordId: string,
+): Promise<number> {
+  // Dedup: check if this install referral already exists
+  const [existing] = await db
+    .select({ id: referralEvents.id })
+    .from(referralEvents)
+    .where(and(
+      eq(referralEvents.referrerDiscordId, referrerDiscordId),
+      eq(referralEvents.referredDiscordId, referredDiscordId),
+      eq(referralEvents.eventType, 'install'),
+    ))
+    .limit(1);
+  if (existing) return 0;
+
+  // Monthly cap (10 installs/month)
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const monthInstalls = await db
+    .select({ referredDiscordId: referralEvents.referredDiscordId })
+    .from(referralEvents)
+    .where(and(
+      eq(referralEvents.referrerDiscordId, referrerDiscordId),
+      eq(referralEvents.eventType, 'install'),
+      gte(referralEvents.createdAt, thirtyDaysAgo),
+    ));
+  if (new Set(monthInstalls.map((e: any) => e.referredDiscordId)).size >= 10) return 0;
+
+  const activeMacros = await db
+    .select({ id: userMacros.id, expiresAt: userMacros.expiresAt })
+    .from(userMacros)
+    .where(and(
+      eq(userMacros.discordId, referrerDiscordId),
+      eq(userMacros.status, 'active'),
+    ));
+
+  const daysPerMacro = 3;
+  let daysAwarded = 0;
+  for (const macro of activeMacros) {
+    if (macro.expiresAt) {
+      const currentExpiry = new Date(macro.expiresAt as any);
+      const newExpiry = new Date(currentExpiry.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
+      await db.update(userMacros).set({ expiresAt: newExpiry, updatedAt: new Date() })
+        .where(eq(userMacros.id, macro.id));
+    }
+    daysAwarded += daysPerMacro;
+  }
+
+  await db.insert(referralEvents).values({
+    referrerDiscordId,
+    referredDiscordId,
+    eventType: 'install',
+    daysAwarded,
+  });
+  return daysAwarded;
+}
+
+/**
+ * Grant the purchase referral reward: add days (2/5/7 for 7d/1m/lifetime) to
+ * each of the referrer's active timed macros, and record the purchase event
+ * (deduped by orderId). Safe to call from the SellAuth webhook. No-ops if
+ * already recorded or the referrer has no active macros.
+ */
+export async function grantPurchaseReward(
+  db: any,
+  referrerDiscordId: string,
+  referredDiscordId: string,
+  orderId: string,
+  macro: string,
+  duration: string,
+): Promise<number> {
+  // Dedup by orderId
+  const [existing] = await db
+    .select({ id: referralEvents.id })
+    .from(referralEvents)
+    .where(eq(referralEvents.orderId, orderId))
+    .limit(1);
+  if (existing) return 0;
+
+  let daysPerMacro: number;
+  if (duration === '7d') daysPerMacro = 2;
+  else if (duration === '1m') daysPerMacro = 5;
+  else if (duration === 'lifetime') daysPerMacro = 7;
+  else daysPerMacro = 2;
+
+  const activeMacros = await db
+    .select({ id: userMacros.id, expiresAt: userMacros.expiresAt })
+    .from(userMacros)
+    .where(and(
+      eq(userMacros.discordId, referrerDiscordId),
+      eq(userMacros.status, 'active'),
+    ));
+
+  let daysAwarded = 0;
+  for (const activeMacro of activeMacros) {
+    if (activeMacro.expiresAt) {
+      const currentExpiry = new Date(activeMacro.expiresAt as any);
+      const newExpiry = new Date(currentExpiry.getTime() + daysPerMacro * 24 * 60 * 60 * 1000);
+      await db.update(userMacros).set({ expiresAt: newExpiry, updatedAt: new Date() })
+        .where(eq(userMacros.id, activeMacro.id));
+    }
+    daysAwarded += daysPerMacro;
+  }
+
+  await db.insert(referralEvents).values({
+    referrerDiscordId,
+    referredDiscordId,
+    eventType: 'purchase',
+    orderId,
+    macroName: macro,
+    duration,
+    daysAwarded,
+  });
+  return daysAwarded;
+}
+
 const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
   // ── GET /referrals/my-info ───────────────────────────────────────────────
   app.get('/referrals/my-info', { preHandler: desktopSessionAuth }, async (request, reply) => {

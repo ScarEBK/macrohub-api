@@ -1,5 +1,5 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, sql } from 'drizzle-orm';
 import { verifySellAuthSignature, generateLicenseKey } from '../lib/crypto.js';
 import {
   users,
@@ -8,6 +8,7 @@ import {
   pendingEntitlements,
   migrationClaims,
 } from '../db/schema.js';
+import { grantPurchaseReward } from './referrals.js';
 
 // ── SKU mapping — REAL SellAuth product/variant IDs (verified from the
 //    SellAuth API 2026-06-17). The old 762/763/764 IDs were stale and didn't
@@ -153,6 +154,22 @@ function calculateExpiry(duration: string): Date | null {
   }
 }
 
+// H-1 fix (audit 2026-06-19): duration in milliseconds for the upsert-extend
+// SQL. Mirrors calculateExpiry's cases. Lifetime returns null (handled
+// separately in the upsert set).
+function calculateDurationMs(duration: string): number | null {
+  switch (duration) {
+    case '1m':
+      return 30 * 24 * 60 * 60 * 1000;
+    case '7d':
+      return 7 * 24 * 60 * 60 * 1000;
+    case 'lifetime':
+      return null;
+    default:
+      return 30 * 24 * 60 * 60 * 1000;
+  }
+}
+
 const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
   const db = fastify.db;
 
@@ -288,7 +305,15 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
 
               for (const lk of createdKeys) {
                 const expiresAt = calculateExpiry(lk.duration);
+                const lifetime = !expiresAt;
 
+                // H-1 fix (audit 2026-06-19): previously used onConflictDoNothing,
+                // which silently DROPPED the grant for a repeat buyer who already
+                // owned an active macro for the same product — the key was
+                // marked redeemed and the user got nothing. Now we upsert with
+                // an extend: stack the new duration onto the existing expiry (or
+                // start from now if the existing row is revoked/expired), and
+                // upgrade timed → lifetime. Never downgrade lifetime → timed.
                 await tx.insert(userMacros).values({
                   discordId,
                   macro: lk.macro,
@@ -297,7 +322,23 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
                   duration: lk.duration,
                   expiresAt: expiresAt ?? undefined,
                   licenseKeyId: lk.id,
-                }).onConflictDoNothing();
+                }).onConflictDoUpdate({
+                  target: [userMacros.discordId, userMacros.macro],
+                  set: (ref: any) => ({
+                    status: 'active',
+                    source: 'sellauth',
+                    duration: lk.duration,
+                    expiresAt: lifetime
+                      ? null
+                      : sql`case
+                        when ${ref.expiresAt} is null then ${expiresAt}
+                        when ${ref.status} = 'active' and ${ref.expiresAt} > now() then ${ref.expiresAt} + ${calculateDurationMs(lk.duration)}
+                        else ${expiresAt}
+                      end`,
+                    licenseKeyId: lk.id,
+                    updatedAt: new Date(),
+                  }),
+                });
 
                 await tx
                   .update(licenseKeys)
@@ -369,6 +410,10 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
               .limit(1)
               .then((rows: any[]) => rows[0]);
 
+            const lifetime = !expiresAt;
+
+            // H-1 fix (audit 2026-06-19): upsert with extend instead of
+            // onConflictDoNothing (see bundle path above for full rationale).
             await tx.insert(userMacros).values({
               discordId,
               macro,
@@ -377,7 +422,23 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
               duration,
               expiresAt: expiresAt ?? undefined,
               licenseKeyId: createdKey!.id,
-            }).onConflictDoNothing();
+            }).onConflictDoUpdate({
+              target: [userMacros.discordId, userMacros.macro],
+              set: (ref: any) => ({
+                status: 'active',
+                source: 'sellauth',
+                duration,
+                expiresAt: lifetime
+                  ? null
+                  : sql`case
+                    when ${ref.expiresAt} is null then ${expiresAt}
+                    when ${ref.status} = 'active' and ${ref.expiresAt} > now() then ${ref.expiresAt} + ${calculateDurationMs(duration)}
+                    else ${expiresAt}
+                  end`,
+                licenseKeyId: createdKey!.id,
+                updatedAt: new Date(),
+              }),
+            });
 
             await tx
               .update(licenseKeys)
@@ -433,6 +494,38 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
         throw err;
       }
     });
+
+    // C-2 fix (audit 2026-06-19): grant the purchase referral reward. The
+    // entire referral reward system was previously dead — the webhook created
+    // keys/macros but never invoked apply-purchase-reward, so referrers got
+    // nothing when their referrals bought. Now, after the fulfillment
+    // transaction commits, look up the buyer's referrer and grant reward days
+    // for each macro in this order. Run OUTSIDE the transaction so a reward
+    // failure can't roll back the fulfillment, and swallow errors so a
+    // reward bug doesn't 500 the webhook (SellAuth would retry pointlessly).
+    if (discordId) {
+      try {
+        const [buyer] = await db
+          .select({ referredByDiscordId: users.referredByDiscordId })
+          .from(users)
+          .where(eq(users.discordId, discordId))
+          .limit(1);
+        const referrerDiscordId = buyer?.referredByDiscordId;
+        if (referrerDiscordId) {
+          const fulfilled = await db
+            .select({ macro: licenseKeys.macro, duration: licenseKeys.duration })
+            .from(licenseKeys)
+            .where(eq(licenseKeys.sellauthOrderId, orderId));
+          for (const lk of fulfilled) {
+            await grantPurchaseReward(db, referrerDiscordId, discordId, orderId, lk.macro, lk.duration);
+          }
+        }
+      } catch (rewardErr) {
+        // Non-fatal: fulfillment already succeeded. Log and continue so the
+        // webhook returns 200 and SellAuth doesn't retry the whole order.
+        console.error('[sellauth] referral purchase reward failed (non-fatal):', rewardErr);
+      }
+    }
 
     reply.code(200).send(fulfilledKeys.join('\n'));
   });

@@ -72,15 +72,20 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       try {
         await db.insert(licenseKeys).values(values);
       } catch (err: any) {
+        // H-8 fix (audit 2026-06-19): don't leak raw Postgres errors (column/
+        // constraint names) to the client. Log server-side, return a generic
+        // message. The global error handler (index.ts) masks 5xx but this
+        // per-route catch bypassed it.
         console.error('[DB INSERT ERROR]', err);
-        const msg = err?.message || String(err);
-        return reply.code(500).send({ error: `Database insert failed: ${msg}` });
+        return reply.code(500).send({ error: 'Failed to generate license keys. Try again.' });
       }
 
       return reply.send({ keys });
     } catch (err: any) {
+      // H-8 fix (audit 2026-06-19): same — don't leak err.message. Let the
+      // caller see a generic failure; the real error is logged above.
       console.error('[GENERATE ERROR]', err);
-      return reply.code(500).send({ error: err?.message || String(err) });
+      return reply.code(500).send({ error: 'Key generation failed. Try again.' });
     }
   });
 
@@ -128,6 +133,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .select({
         hwid: users.hwid,
         hwidResetAllowed: users.hwidResetAllowed,
+        bannedMacros: users.bannedMacros,
       })
       .from(users)
       .where(eq(users.discordId, discordId))
@@ -140,11 +146,28 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       return reply.code(403).send({ error: 'HWID_REBIND_AVAILABLE' });
     }
 
+    // C-1 fix (audit 2026-06-19): account-level ban check. A user who was
+    // banned from this macro (via /licenses/ban setting bannedMacros) cannot
+    // redeem ANY key for it — including a freshly purchased one. This
+    // restores the ban-bypass guard that was removed 2026-06-19; without it,
+    // a ban was circumventable by spending $1 on a new key. The per-key ban
+    // check above still prevents the banned key itself from being reused;
+    // this is the account-level layer on top.
+    const bannedList = Array.isArray(user?.bannedMacros) ? user.bannedMacros : [];
+    if (bannedList.includes(licenseKey.macro)) {
+      return reply.code(403).send({
+        error: 'ACCOUNT_BANNED_FROM_MACRO: This account is restricted from this macro because of a previous banned key. Contact support on Discord.',
+      });
+    }
+
     // Ban-bypass guard removed (2026-06-19): the product owner wants a banned
     // user to be able to buy a fresh key and redeem it. The per-key ban check
     // above (status === 'banned') still prevents the banned key itself from
     // being reused. We now compute the new expiry from now when reactivating a
     // revoked row so leftover time is not stacked onto the new purchase.
+    // NOTE (audit 2026-06-19): the account-level bannedMacros check above
+    // supersedes this comment for actually-banned accounts; a user who is NOT
+    // in bannedMacros can still re-purchase, which is the intended behavior.
 
     // Wrap the write path in a transaction so concurrent redeems of two keys for
     // the same macro cannot race on the same user_macros row.
@@ -337,7 +360,15 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .set({ status: 'banned' })
       .where(eq(licenseKeys.id, licenseKey.id));
 
-    // If key was redeemed, revoke the corresponding userMacro
+    // If the key was redeemed, revoke the corresponding userMacro.
+    //
+    // BL-1 fix (audit 2026-06-19): revoke ONLY the userMacro whose
+    // licenseKeyId matches this banned key — NOT every macro the user owns
+    // for this macro name. Previously this revoked by (discordId, macro)
+    // alone, so banning an OLD/expired key would revoke a CURRENT entitlement
+    // granted by a different, still-valid key the user redeemed later. That
+    // locked users out of valid lifetime purchases when admins banned a key
+    // that had already been superseded.
     if (licenseKey.redeemedBy) {
       await db
         .update(userMacros)
@@ -345,8 +376,35 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
         .where(and(
           eq(userMacros.discordId, licenseKey.redeemedBy),
           eq(userMacros.macro, licenseKey.macro),
+          eq(userMacros.licenseKeyId, licenseKey.id),
         ));
+
+      // C-1 fix (audit 2026-06-19): add the macro to the user's account-level
+      // bannedMacros list so they cannot circumvent the ban by redeeming a
+      // fresh key for the same macro. Idempotent — only adds if absent.
+      const [bannedUser] = await db
+        .select({ bannedMacros: users.bannedMacros })
+        .from(users)
+        .where(eq(users.discordId, licenseKey.redeemedBy))
+        .limit(1);
+      const currentBanned = Array.isArray(bannedUser?.bannedMacros) ? bannedUser.bannedMacros : [];
+      if (!currentBanned.includes(licenseKey.macro)) {
+        await db
+          .update(users)
+          .set({ bannedMacros: [...currentBanned, licenseKey.macro], updatedAt: new Date() })
+          .where(eq(users.discordId, licenseKey.redeemedBy));
+      }
     }
+
+    // H-2 fix (audit 2026-06-19): audit trail. Every admin action should be
+    // traceable. The bot uses x-admin-secret with no actor identity, so log
+    // actor as 'bot' (admin console could pass a real discordId separately).
+    await db.insert(adminLogs).values({
+      action: 'license_ban',
+      actorDiscordId: 'bot',
+      targetDiscordId: licenseKey.redeemedBy ?? null,
+      details: JSON.stringify({ key: licenseKey.key, macro: licenseKey.macro }),
+    });
 
     return reply.send({ ok: true });
   });
@@ -387,7 +445,14 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       .set({ status: newStatus })
       .where(eq(licenseKeys.id, licenseKey.id));
 
-    // If there was a revoked userMacro, restore it to 'active'
+    // If there was a revoked userMacro tied to THIS key, restore it to active.
+    //
+    // BL-1/C-4 fix (audit 2026-06-19): restore only the userMacro whose
+    // licenseKeyId matches this key, so unbanning a key the user already
+    // superseded (by redeeming a different key) does not silently no-op or
+    // clobber the current active entitlement. If the macro's expiresAt has
+    // passed, set it to 'expired' (not leave it 'revoked') so the user sees a
+    // "Renew" state rather than a permanent lock.
     if (licenseKey.redeemedBy) {
       const [revokedMacro] = await db
         .select()
@@ -395,6 +460,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
         .where(and(
           eq(userMacros.discordId, licenseKey.redeemedBy),
           eq(userMacros.macro, licenseKey.macro),
+          eq(userMacros.licenseKeyId, licenseKey.id),
           eq(userMacros.status, 'revoked'),
         ))
         .limit(1);
@@ -407,9 +473,37 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
             .update(userMacros)
             .set({ status: 'active', updatedAt: now })
             .where(eq(userMacros.id, revokedMacro.id));
+        } else {
+          await db
+            .update(userMacros)
+            .set({ status: 'expired', updatedAt: now })
+            .where(eq(userMacros.id, revokedMacro.id));
         }
       }
+
+      // C-1 fix (audit 2026-06-19): remove the macro from the user's
+      // account-level bannedMacros list so they can redeem again. Idempotent.
+      const [bannedUser] = await db
+        .select({ bannedMacros: users.bannedMacros })
+        .from(users)
+        .where(eq(users.discordId, licenseKey.redeemedBy))
+        .limit(1);
+      const currentBanned = Array.isArray(bannedUser?.bannedMacros) ? bannedUser.bannedMacros : [];
+      if (currentBanned.includes(licenseKey.macro)) {
+        await db
+          .update(users)
+          .set({ bannedMacros: currentBanned.filter((m: string) => m !== licenseKey.macro), updatedAt: new Date() })
+          .where(eq(users.discordId, licenseKey.redeemedBy));
+      }
     }
+
+    // H-2 fix (audit 2026-06-19): audit trail for unban.
+    await db.insert(adminLogs).values({
+      action: 'license_unban',
+      actorDiscordId: 'bot',
+      targetDiscordId: licenseKey.redeemedBy ?? null,
+      details: JSON.stringify({ key: licenseKey.key, macro: licenseKey.macro }),
+    });
 
     return reply.send({ ok: true });
   });
@@ -431,6 +525,14 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
         eq(userMacros.macro, body.macro),
       ));
 
+    // H-2 fix (audit 2026-06-19): audit trail.
+    await db.insert(adminLogs).values({
+      action: 'license_revoke',
+      actorDiscordId: 'bot',
+      targetDiscordId: body.discordId,
+      details: JSON.stringify({ macro: body.macro }),
+    });
+
     return reply.send({ ok: true });
   });
 
@@ -443,18 +545,24 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       return reply.code(400).send({ error: 'Missing or invalid fields: discordId, macro, days' });
     }
 
+    // H-3 fix (audit 2026-06-19): previously add-time required status='active',
+    // so an admin could NOT reinstate a revoked/expired macro by adding time —
+    // they got a 404 and had to use /licenses/unban (which has its own edge
+    // cases). Now we select the macro regardless of status (active/revoked/
+    // expired) and the update below sets status='active', mirroring the Convex
+    // legacy addTime behavior. This gives admins a single, predictable
+    // reinstate path.
     const [userMacro] = await db
       .select()
       .from(userMacros)
       .where(and(
         eq(userMacros.discordId, body.discordId),
         eq(userMacros.macro, body.macro),
-        eq(userMacros.status, 'active'),
       ))
       .limit(1);
 
     if (!userMacro) {
-      return reply.code(404).send({ error: 'No active macro found for this user' });
+      return reply.code(404).send({ error: 'No macro found for this user' });
     }
 
     const now = new Date();
@@ -468,18 +576,26 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     }
 
     let newExpiresAt: Date;
-    if (new Date(userMacro.expiresAt) > now) {
+    if (new Date(userMacro.expiresAt) > now && userMacro.status === 'active') {
       // Still active — stack the added time onto the existing expiry
       newExpiresAt = new Date(new Date(userMacro.expiresAt).getTime() + addMs);
     } else {
-      // Expired — start fresh from now
+      // Expired or revoked — start fresh from now and reinstate to active
       newExpiresAt = new Date(now.getTime() + addMs);
     }
 
     await db
       .update(userMacros)
-      .set({ expiresAt: newExpiresAt, updatedAt: now })
+      .set({ status: 'active', expiresAt: newExpiresAt, updatedAt: now })
       .where(eq(userMacros.id, userMacro.id));
+
+    // H-2 fix (audit 2026-06-19): audit trail.
+    await db.insert(adminLogs).values({
+      action: 'license_add_time',
+      actorDiscordId: 'bot',
+      targetDiscordId: body.discordId,
+      details: JSON.stringify({ macro: body.macro, days: body.days, reinstated: userMacro.status !== 'active' }),
+    });
 
     return reply.send({ ok: true, newExpiresAt: newExpiresAt.toISOString() });
   });

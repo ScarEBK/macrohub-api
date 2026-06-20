@@ -6,9 +6,11 @@ import {
   pendingEntitlements,
   migrationClaims,
   referralCodes,
-  referralEvents,
   userMacros,
+  trialRegistrations,
+  adminLogs,
 } from '../db/schema.js';
+import { grantInstallReward } from './referrals.js';
 import { verifyOAuthProof, generateSessionToken, timingSafeEqual } from '../lib/crypto.js';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 
@@ -156,9 +158,23 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
           await db.update(users).set({ hwid }).where(eq(users.discordId, discordId));
           user = { ...user, hwid };
         } else if (user.hwidResetAllowed) {
-          const newCount = (user.hwidResetCount ?? 0) + 1;
-          await db.update(users).set({ hwid, hwidResetAllowed: false, hwidResetCount: newCount }).where(eq(users.discordId, discordId));
-          user = { ...user, hwid, hwidResetAllowed: false, hwidResetCount: newCount };
+          // C-5 fix (audit 2026-06-19): atomic check-and-consume of the reset
+          // grant via a single conditional UPDATE ... RETURNING, mirroring the
+          // desktopSessionAuth middleware. Prevents two concurrent OAuth
+          // sign-ins from both rebinding to different HWIDs and losing the
+          // hwidResetCount increment.
+          const consumed = await db
+            .update(users)
+            .set({ hwid, hwidResetAllowed: false, hwidResetCount: sql`${users.hwidResetCount} + 1` })
+            .where(and(eq(users.discordId, discordId), eq(users.hwidResetAllowed, true)))
+            .returning({ id: users.id });
+          if (consumed.length === 1) {
+            user = { ...user, hwid, hwidResetAllowed: false, hwidResetCount: (user.hwidResetCount ?? 0) + 1 };
+          } else {
+            // Grant was consumed by a concurrent sign-in between our read and
+            // update. Treat like no grant available.
+            return reply.code(403).send({ error: 'HWID_REBIND_AVAILABLE' });
+          }
         } else {
           // Signed in on a new PC with no reset grant. Return a distinct code
           // so the desktop can show a clear "contact support to transfer"
@@ -236,10 +252,14 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
           .where(eq(users.discordId, discordId));
         user = { ...user, referredByDiscordId: ref.discordId };
 
-        await db.insert(referralEvents).values({
-          referrerDiscordId: ref.discordId,
-          referredDiscordId: discordId,
-          eventType: 'install',
+        // C-2 fix (audit 2026-06-19): actually GRANT the install reward days
+        // to the referrer's active macros. Previously this only inserted a
+        // referralEvents row with no daysAwarded, so referrers got nothing.
+        // grantInstallReward handles the dedup + monthly cap + day-granting
+        // + event insert in one call.
+        await grantInstallReward(db, ref.discordId, discordId).catch((e) => {
+          // Non-fatal: don't fail the sign-in if the reward grant errors.
+          request.log.error({ err: e }, 'install referral reward failed');
         });
       }
     }
@@ -353,6 +373,20 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     const { discordId } = request.body;
     const { db } = request.server;
 
+    // H-12 fix (audit 2026-06-19): previously this was a blind update that
+    // returned {ok:true} even for a discordId with no user row, so the bot
+    // told the admin "Cleared HWID for X" for a non-existent user and the
+    // user then still failed HWID mismatch — a support loop. Now verify the
+    // user exists first and 404 if not.
+    const [existing] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.discordId, discordId))
+      .limit(1);
+    if (!existing) {
+      return reply.code(404).send({ error: 'No user found with that Discord ID.' });
+    }
+
     // Mirror the legacy Convex clearHwidForBot: null the stored HWID AND set
     // hwidResetAllowed = true so the user's next sign-in on the new machine
     // rebinds cleanly (the stored-hwid is null, so the /auth/oauth "no stored
@@ -365,6 +399,28 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       hwidResetAllowed: true,
     })
       .where(eq(users.discordId, discordId));
+
+    // M-11 fix (audit 2026-06-19): invalidate existing desktop sessions for
+    // this user so the OLD machine can't keep using a stale token until it
+    // expires (up to 30 days). The user must re-sign-in on the new machine,
+    // which is the intended flow after an HWID reset.
+    await db.delete(desktopSessions)
+      .where(eq(desktopSessions.discordId, discordId));
+
+    // H-4 fix (audit 2026-06-19): clear the user's trial registrations too,
+    // so an HWID reset can't bypass the one-trial-per-machine lock. Without
+    // this, a user could reset HWID, re-sign-in (new users.hwid), and claim a
+    // 2nd trial because trialRegistrations still held the old HWID.
+    await db.delete(trialRegistrations)
+      .where(eq(trialRegistrations.discordId, discordId));
+
+    // H-2 fix (audit 2026-06-19): audit trail.
+    await db.insert(adminLogs).values({
+      action: 'clear_hwid',
+      actorDiscordId: 'bot',
+      targetDiscordId: discordId,
+      details: JSON.stringify({}),
+    });
 
     return reply.send({ ok: true });
   });

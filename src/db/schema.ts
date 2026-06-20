@@ -25,6 +25,12 @@ export const users = pgTable(
     hwidResetAllowed: boolean("hwid_reset_allowed").default(false),
     hwidResetCount: integer("hwid_reset_count").default(0),
     referredByDiscordId: varchar("referred_by_discord_id", { length: 255 }),
+    // C-1 fix (audit 2026-06-19): account-level ban list. JSON array of macro
+    // names the user is banned from redeeming (set by /licenses/ban, cleared by
+    // /licenses/unban). Prevents a banned user from circumventing the ban by
+    // buying a fresh key for the same macro. The per-key ban check still
+    // applies; this is the account-level layer on top.
+    bannedMacros: jsonb("banned_macros").default([]),
     createdAt: timestamp("created_at").defaultNow(),
     updatedAt: timestamp("updated_at").defaultNow(),
     lastSeenAt: timestamp("last_seen_at").defaultNow(),

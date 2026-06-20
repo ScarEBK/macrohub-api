@@ -124,6 +124,13 @@ const MIGRATIONS = [
   { name: 'create unique index license_keys_sellauth_order_id_unique',
     sql: `CREATE UNIQUE INDEX IF NOT EXISTS license_keys_sellauth_order_id_unique ON license_keys (sellauth_order_id);`,
   },
+  // 9. C-1 fix (audit 2026-06-19): account-level ban list on users. JSON array
+  // of macro names the user is banned from redeeming. Set by /licenses/ban,
+  // cleared by /licenses/unban. Prevents a banned user from circumventing a
+  // ban by buying a fresh key for the same macro.
+  { name: 'add users.banned_macros',
+    sql: `ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_macros JSONB DEFAULT '[]'::jsonb;`,
+  },
 ];
 
 export async function runMigrations(dbUrl: string) {
