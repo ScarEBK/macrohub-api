@@ -94,12 +94,16 @@ export async function grantPurchaseReward(
   macro: string,
   duration: string,
 ): Promise<number> {
-  // Dedup by orderId
-  const [existing] = await db
-    .select({ id: referralEvents.id })
-    .from(referralEvents)
-    .where(eq(referralEvents.orderId, orderId))
-    .limit(1);
+// Dedup by (orderId, macroName) so bundle orders with 3 different
+// macros each get their own referral reward, not just the first.
+const [existing] = await db
+  .select({ id: referralEvents.id })
+  .from(referralEvents)
+  .where(and(
+    eq(referralEvents.orderId, orderId),
+    eq(referralEvents.macroName, macro),
+  ))
+  .limit(1);
   if (existing) return 0;
 
   let daysPerMacro: number;
@@ -213,22 +217,24 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
       ));
 
     // Calculate purchase rewards by duration tier
-    const purchaseRewards = { week: 0, month: 0, lifetime: 0 };
-    for (const purchase of purchaseDetails) {
-      const duration = purchase.duration;
-      if (duration === '7d') {
-        purchaseRewards.week++;
-      } else if (duration === '1m') {
-        purchaseRewards.month++;
-      } else if (duration === 'lifetime') {
-        purchaseRewards.lifetime++;
-      }
-    }
+// Return the static reward tier amounts (what the referrer WILL receive
+// per purchase tier), plus the count of past referral purchases.
+const purchaseRewards = { week: 2, month: 5, lifetime: 7 };
+let purchaseCountWeek = 0;
+let purchaseCountMonth = 0;
+let purchaseCountLifetime = 0;
+for (const purchase of purchaseDetails) {
+  const duration = purchase.duration;
+  if (duration === '7d') purchaseCountWeek++;
+  else if (duration === '1m') purchaseCountMonth++;
+  else if (duration === 'lifetime') purchaseCountLifetime++;
+}
 
     return reply.send({
       code: codeResult.code,
       linkHint: `https://motionlife.mysellauth.com?ref=${codeResult.code}`,
       installRewardDays: 3,
+      purchaseCountByTier: { week: purchaseCountWeek, month: purchaseCountMonth, lifetime: purchaseCountLifetime },
       purchaseRewards,
     });
   });
@@ -361,11 +367,16 @@ const referralRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     const { referrerDiscordId, referredDiscordId, orderId, macro, duration } = body;
 
-    // Dedup by orderId
+    // Dedup by (orderId, macroName) — matches grantPurchaseReward and the
+    // referral_events_order_id_macro_unique index, so a bundle order's
+    // 2nd/3rd macro reward is not rejected as "already recorded".
     const [existing] = await db
       .select({ id: referralEvents.id })
       .from(referralEvents)
-      .where(eq(referralEvents.orderId, orderId))
+      .where(and(
+        eq(referralEvents.orderId, orderId),
+        eq(referralEvents.macroName, macro),
+      ))
       .limit(1);
 
     if (existing) {

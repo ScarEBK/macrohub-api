@@ -13,5 +13,10 @@ ALTER TABLE license_keys RENAME COLUMN discord_id TO redeemed_by;
 -- 3. announcements: add dismissible boolean
 ALTER TABLE announcements ADD COLUMN IF NOT EXISTS dismissible BOOLEAN DEFAULT FALSE;
 
--- 4. pending_entitlements: add expires_at
 ALTER TABLE pending_entitlements ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;
+
+-- 5. referral_events: change unique index from order_id alone to (order_id, macro_name)
+--    so bundle orders (3 macros, same order_id) each get their own referral reward.
+DROP INDEX IF EXISTS referral_events_order_id_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS referral_events_order_id_macro_unique
+  ON referral_events(order_id, macro_name);

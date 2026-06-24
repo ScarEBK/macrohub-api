@@ -77,7 +77,7 @@ export const referralEvents = pgTable(
   (table) => [
     index("referral_events_referrer_idx").on(table.referrerDiscordId),
     index("referral_events_referred_idx").on(table.referredDiscordId),
-    uniqueIndex("referral_events_order_id_unique").on(table.orderId),
+    uniqueIndex("referral_events_order_id_macro_unique").on(table.orderId, table.macroName),
   ],
 );
 

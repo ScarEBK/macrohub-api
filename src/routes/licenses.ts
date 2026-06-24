@@ -172,16 +172,23 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     // Wrap the write path in a transaction so concurrent redeems of two keys for
     // the same macro cannot race on the same user_macros row.
     const now = new Date();
-    const result = await db.transaction(async (tx) => {
-      // Mark key as redeemed
-      await tx
-        .update(licenseKeys)
-        .set({
-          status: 'redeemed',
-          redeemedBy: discordId,
-          redeemedAt: now,
-        })
-        .where(eq(licenseKeys.id, licenseKey.id));
+let result;
+    try {
+      result = await db.transaction(async (tx) => {
+// Atomically claim the key: only flip available -> redeemed.
+// If 0 rows updated, another request redeemed this key concurrently.
+const claimed = await tx
+  .update(licenseKeys)
+  .set({
+    status: 'redeemed',
+    redeemedBy: discordId,
+    redeemedAt: now,
+  })
+.where(and(eq(licenseKeys.id, licenseKey.id), eq(licenseKeys.status, 'available')))
+  .returning({ id: licenseKeys.id });
+if (claimed.length === 0) {
+  throw new Error('KEY_ALREADY_REDEEMED');
+}
 
       // Calculate duration
       const durationMs = DURATION_MS[licenseKey.duration];
@@ -219,12 +226,20 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
           expiresAt = null;
           expiresAtMs = null;
         } else {
-          const baseDate =
+          // Only stack onto leftover time when the existing entitlement is
+          // genuinely active with meaningful time left (>60s). Closes the
+          // +1-day bug where a barely-future stale expiresAt (e.g. 12h left)
+          // stacked 12h+24h=36h -> ceil(36/24)=2 days. revoked/expired/banned
+          // always start fresh from now.
+          const FRESH_START_STATUSES = new Set(['revoked', 'expired', 'banned']);
+          const canExtend =
+            !FRESH_START_STATUSES.has(existingMacro.status) &&
             existingMacro.status === 'active' &&
-            existingMacro.expiresAt &&
-            new Date(existingMacro.expiresAt) > now
-              ? new Date(existingMacro.expiresAt)
-              : now;
+            existingMacro.expiresAt != null &&
+            new Date(existingMacro.expiresAt).getTime() > now.getTime() + 60_000;
+          const baseDate = canExtend
+            ? new Date(existingMacro.expiresAt!)
+            : now;
           expiresAt = new Date(baseDate.getTime() + durationMs);
           expiresAtMs = expiresAt.getTime();
         }
@@ -273,7 +288,13 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
         });
 
       return { macro, duration, expiresAtMs };
-    });
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'KEY_ALREADY_REDEEMED') {
+        return reply.code(409).send({ error: 'This key has already been redeemed.' });
+      }
+      throw err;
+    }
 
     return reply.send({
       success: true,
