@@ -122,7 +122,7 @@ await app.register(rateLimit, {
     // secret falls through to the shared IP bucket (the adminAuth preHandler
     // will still 401 it downstream).
     const provided = request.headers['x-admin-secret'];
-    const expected = process.env.ADMIN_SECRET || process.env.CONVEX_ADMIN_SECRET;
+    const expected = process.env.ADMIN_SECRET;
     if (typeof provided === 'string' && typeof expected === 'string' && expected.length > 0) {
       // Cheap length gate then constant-time compare. Both sides are
       // app-controlled lengths so the length gate doesn't leak timing.
