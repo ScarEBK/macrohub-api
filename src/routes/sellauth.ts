@@ -27,6 +27,8 @@ const NUMERIC_SKU_LOOKUP: Record<string, { macro: string; duration: string }> = 
   '100843:151984': { macro: 'Strafe', duration: 'lifetime' },
   '100843:929403': { macro: 'Strafe', duration: '1m' },
   '100843:929404': { macro: 'Strafe', duration: '7d' },
+  // Macro Bundle — product 770856 (all three macros, lifetime)
+  '770856:1286386': { macro: 'all', duration: 'lifetime' },
 };
 
 // Legacy IDs kept for backward compat with any old SellAuth webhook configs.
@@ -91,7 +93,9 @@ function resolveSkuMapping(
     const key = `${productId}:${variantId}`;
     const match = NUMERIC_SKU_LOOKUP[key] ?? LEGACY_SKU_LOOKUP[key];
     if (match) {
-      return { ...match, isBundle: false };
+      const isBundle =
+        match.macro.toLowerCase() === 'all' || match.macro.toLowerCase() === 'bundle';
+      return { ...match, isBundle };
     }
   }
 
