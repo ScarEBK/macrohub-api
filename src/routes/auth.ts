@@ -1,3 +1,4 @@
+import { fetchDiscordUsername } from '../lib/discord.js';
 import { FastifyInstance, FastifyPluginCallback } from 'fastify';
 import { eq, and, lt, gt, or, sql } from 'drizzle-orm';
 import {
@@ -210,28 +211,28 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
     }
 
     // ── 5. Merge migration claims ───────────────────────────────────────────────
-    // Match by discordId OR by sellauthUsername (exact case-insensitive). We use
-    // lower() = lower() instead of ilike() to avoid wildcard injection (% and _
-    // are ilike wildcards that could match unintended claims). This also prevents
-    // username-squatting attacks where an attacker changes their Discord username
-    // to a partial match of a victim's pending claim.
-    //
-    // SECURITY NOTE: username-based claim resolution carries an inherent risk —
-    // if an attacker changes their Discord username to exactly match a buyer's
-    // SellAuth "Discord Name" custom field, they could steal the buyer's macros.
-    // This is accepted as a tradeoff because: (1) Discord usernames are unique
-    // at any point in time, (2) the attacker would need to know the exact name
-    // the buyer typed, (3) claims are typically resolved quickly after purchase.
-    // For high-value claims, prefer discordId-based resolution.
-    const trimmedUsername = username.trim().toLowerCase();
-    const claims = await db.select().from(migrationClaims)
-      .where(and(
-        or(
+    // Match by discordId, or by the SellAuth "Discord Name" the buyer typed.
+    // The username in the request body is client-supplied and NOT covered by
+    // the OAuth proof (which only signs discordId:issuedAt), so it can't be
+    // trusted for claim matching — anyone could post a victim's name and take
+    // their pending macros. We resolve the real username from Discord for the
+    // proven discordId instead; if that lookup is unavailable we match by
+    // discordId only and username claims wait for the next sign-in.
+    const verifiedUsername = await fetchDiscordUsername(discordId);
+    if (verifiedUsername && verifiedUsername !== username) {
+      // Keep users.username honest too — /migration/import-row matches on it.
+      await db.update(users).set({ username: verifiedUsername })
+        .where(eq(users.discordId, discordId));
+      user = { ...user, username: verifiedUsername };
+    }
+    const claimMatch = verifiedUsername
+      ? or(
           eq(migrationClaims.discordId, discordId),
-          sql`lower(${migrationClaims.sellauthUsername}) = ${trimmedUsername}`,
-        ),
-        eq(migrationClaims.status, 'pending'),
-      ));
+          sql`lower(${migrationClaims.sellauthUsername}) = ${verifiedUsername.toLowerCase()}`,
+        )
+      : eq(migrationClaims.discordId, discordId);
+    const claims = await db.select().from(migrationClaims)
+      .where(and(claimMatch, eq(migrationClaims.status, 'pending')));
 
     for (const claim of claims) {
       // Extend-on-conflict: a returning customer with multiple claims for the

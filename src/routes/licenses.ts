@@ -1,5 +1,5 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, notInArray } from 'drizzle-orm';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { generateLicenseKey, normalizeLicenseKey } from '../lib/crypto.js';
 import { licenseKeys, userMacros, adminLogs, users } from '../db/schema.js';
@@ -14,6 +14,13 @@ const DURATION_MS: Record<string, number | null> = {
   '30d': 30 * 24 * 60 * 60 * 1000,
   lifetime: null,
 };
+
+class KeyAlreadyRedeemedError extends Error {}
+
+function isUniqueViolation(err: unknown): boolean {
+  const e = err as { code?: string; cause?: { code?: string } } | null;
+  return e?.code === '23505' || e?.cause?.code === '23505';
+}
 
 const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
   // ── GET /licenses/ping ────────────────────────────────────────────────────
@@ -169,19 +176,28 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     // supersedes this comment for actually-banned accounts; a user who is NOT
     // in bannedMacros can still re-purchase, which is the intended behavior.
 
-    // Wrap the write path in a transaction so concurrent redeems of two keys for
-    // the same macro cannot race on the same user_macros row.
-    const now = new Date();
-    const result = await db.transaction(async (tx) => {
-      // Mark key as redeemed
-      await tx
+    // Wrap the write path in a transaction. The key is claimed with a guarded
+    // UPDATE … RETURNING so two parallel redeems of the SAME key can't both
+    // succeed (the status check above is only a fast path), and the user_macros
+    // row is locked FOR UPDATE so two different keys for the same macro stack
+    // instead of one overwriting the other.
+    const redeemOnce = () => db.transaction(async (tx) => {
+      const now = new Date();
+      const claimed = await tx
         .update(licenseKeys)
         .set({
           status: 'redeemed',
           redeemedBy: discordId,
           redeemedAt: now,
         })
-        .where(eq(licenseKeys.id, licenseKey.id));
+        .where(and(
+          eq(licenseKeys.id, licenseKey.id),
+          notInArray(licenseKeys.status, ['redeemed', 'banned']),
+        ))
+        .returning({ id: licenseKeys.id });
+      if (claimed.length === 0) {
+        throw new KeyAlreadyRedeemedError();
+      }
 
       // Calculate duration
       const durationMs = DURATION_MS[licenseKey.duration];
@@ -198,10 +214,12 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
           eq(userMacros.discordId, discordId),
           eq(userMacros.macro, macro),
         ))
-        .limit(1);
+        .limit(1)
+        .for('update');
 
       let expiresAt: Date | null;
       let expiresAtMs: number | null;
+      let storedDuration = duration;
 
       if (existingMacro) {
         if (existingMacro.status === 'revoked') {
@@ -215,9 +233,14 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
             details: { macro, key: licenseKey.key, previousStatus: 'revoked' },
           });
         }
-        if (durationMs === null) {
+        const activeLifetime =
+          existingMacro.status === 'active' && existingMacro.expiresAt == null;
+        if (durationMs === null || activeLifetime) {
+          // Lifetime key, or an active lifetime owner redeeming a timed key:
+          // never downgrade lifetime to a timed expiry.
           expiresAt = null;
           expiresAtMs = null;
+          storedDuration = 'lifetime';
         } else {
           const baseDate =
             existingMacro.status === 'active' &&
@@ -234,7 +257,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
           .set({
             status: 'active',
             source: 'redeem',
-            duration,
+            duration: storedDuration,
             expiresAt,
             licenseKeyId: licenseKey.id,
             updatedAt: now,
@@ -274,6 +297,24 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
       return { macro, duration, expiresAtMs };
     });
+
+    let result: { macro: string; duration: string; expiresAtMs: number | null };
+    try {
+      try {
+        result = await redeemOnce();
+      } catch (err) {
+        // Two different keys for a macro the user doesn't own yet can both try
+        // to INSERT the user_macros row; the loser hits the unique index. Retry
+        // once — the second attempt sees the row and extends it.
+        if (!isUniqueViolation(err)) throw err;
+        result = await redeemOnce();
+      }
+    } catch (err) {
+      if (err instanceof KeyAlreadyRedeemedError) {
+        return reply.code(409).send({ error: 'KEY_ALREADY_REDEEMED' });
+      }
+      throw err;
+    }
 
     return reply.send({
       success: true,
@@ -543,6 +584,9 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
 
     if (!body?.discordId || !body?.macro || !body?.days || typeof body.days !== 'number') {
       return reply.code(400).send({ error: 'Missing or invalid fields: discordId, macro, days' });
+    }
+    if (!Number.isFinite(body.days) || body.days <= 0 || body.days > 3650) {
+      return reply.code(400).send({ error: 'days must be between 1 and 3650' });
     }
 
     // H-3 fix (audit 2026-06-19): previously add-time required status='active',

@@ -4,7 +4,7 @@ import postgres from 'postgres';
  * Bootstrap PostgreSQL tables on first deploy (idempotent).
  * Column-level tweaks run afterward in migrate.ts.
  */
-const INIT_SQL = `
+export const INIT_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   discord_id VARCHAR(255) NOT NULL,

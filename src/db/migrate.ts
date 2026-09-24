@@ -1,6 +1,6 @@
 import postgres from 'postgres';
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
   // 1. users: rename avatar → avatar_url, add hwid_reset_count + last_seen_at, add hwid index
   { name: 'rename users.avatar → avatar_url',
     sql: `DO $$ BEGIN
