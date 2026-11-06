@@ -1,5 +1,6 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, and, notInArray } from 'drizzle-orm';
+import { eq, and, isNull, notInArray } from 'drizzle-orm';
+import { clearHwidForUser } from '../lib/hwid.js';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { generateLicenseKey, normalizeLicenseKey } from '../lib/crypto.js';
 import { licenseKeys, userMacros, adminLogs, users } from '../db/schema.js';
@@ -448,6 +449,127 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     });
 
     return reply.send({ ok: true });
+  });
+
+  // ── Self-service helpers (shop → API, server-to-server, admin secret) ─────
+  const MAX_KEY_LEN = 200;
+  const bodyKey = (body: unknown): string | null => {
+    const k = (body as { key?: unknown } | null)?.key;
+    if (typeof k !== 'string') return null;
+    const t = k.trim();
+    return t.length > 0 && t.length <= MAX_KEY_LEN ? t : null;
+  };
+  const findKeyRow = async (db: any, raw: string) => {
+    for (const fmt of normalizeLicenseKey(raw)) {
+      const [found] = await db.select().from(licenseKeys).where(eq(licenseKeys.key, fmt)).limit(1);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  // ── POST /licenses/lookup ─────────────────────────────────────────────────
+  // Never returns the Discord id, the HWID or any other key.
+  app.post('/licenses/lookup', { preHandler: adminAuth }, async (request, reply) => {
+    const { db } = request.server;
+    const key = bodyKey(request.body);
+    if (!key) return reply.code(400).send({ error: 'Missing or invalid key field' });
+
+    const row = await findKeyRow(db, key);
+    if (!row) return reply.code(404).send({ found: false });
+
+    const redeemed = !!row.redeemedBy;
+    let hwidBound = false;
+    let expiresAt: string | null = null;
+    if (row.redeemedBy) {
+      const [u] = await db.select({ hwid: users.hwid }).from(users)
+        .where(eq(users.discordId, row.redeemedBy)).limit(1);
+      hwidBound = !!u?.hwid;
+      const [um] = await db.select({ expiresAt: userMacros.expiresAt }).from(userMacros)
+        .where(eq(userMacros.licenseKeyId, row.id)).limit(1);
+      expiresAt = um?.expiresAt ? um.expiresAt.toISOString() : null;
+    }
+
+    return reply.send({
+      found: true,
+      status: row.status,
+      macro: row.macro,
+      duration: row.duration,
+      redeemed,
+      hwidBound,
+      expiresAt,
+    });
+  });
+
+  // ── POST /licenses/reset-hwid-by-key ──────────────────────────────────────
+  app.post('/licenses/reset-hwid-by-key', { preHandler: adminAuth }, async (request, reply) => {
+    const { db } = request.server;
+    const key = bodyKey(request.body);
+    if (!key) return reply.code(400).send({ error: 'Missing or invalid key field' });
+
+    const row = await findKeyRow(db, key);
+    if (!row) return reply.code(404).send({ error: 'NOT_FOUND' });
+    if (!row.redeemedBy) return reply.code(409).send({ error: 'NOT_REDEEMED' });
+
+    const [u] = await db.select({ id: users.id }).from(users)
+      .where(eq(users.discordId, row.redeemedBy)).limit(1);
+    if (!u) return reply.code(404).send({ error: 'NOT_FOUND' });
+
+    await clearHwidForUser(db, row.redeemedBy, { via: 'reset-hwid-by-key', keyId: row.id });
+    return reply.send({ ok: true });
+  });
+
+  // ── POST /licenses/regenerate ─────────────────────────────────────────────
+  // Replace an UNREDEEMED key (leaked): old key -> 'banned', new key minted
+  // with the same macro + duration. One transaction; the conditional update
+  // on the old key means parallel calls can mint at most one new key.
+  app.post('/licenses/regenerate', { preHandler: adminAuth }, async (request, reply) => {
+    const { db } = request.server;
+    const key = bodyKey(request.body);
+    if (!key) return reply.code(400).send({ error: 'Missing or invalid key field' });
+
+    const row = await findKeyRow(db, key);
+    if (!row) return reply.code(404).send({ error: 'NOT_FOUND' });
+    if (row.redeemedBy || row.status === 'redeemed') return reply.code(409).send({ error: 'ALREADY_REDEEMED' });
+    if (row.status === 'banned' || row.status === 'revoked') return reply.code(409).send({ error: 'REVOKED' });
+
+    const newKey = generateLicenseKey();
+    const created = await db.transaction(async (tx: any) => {
+      const claimed = await tx
+        .update(licenseKeys)
+        .set({ status: 'banned' })
+        .where(and(
+          eq(licenseKeys.id, row.id),
+          isNull(licenseKeys.redeemedBy),
+          notInArray(licenseKeys.status, ['redeemed', 'banned', 'revoked']),
+        ))
+        .returning({ id: licenseKeys.id });
+      if (claimed.length === 0) return null;
+
+      const [fresh] = await tx.insert(licenseKeys).values({
+        key: newKey,
+        macro: row.macro,
+        duration: row.duration,
+        status: 'available',
+      }).returning({ id: licenseKeys.id });
+
+      await tx.insert(adminLogs).values({
+        action: 'license_regenerate',
+        actorDiscordId: 'bot',
+        targetDiscordId: null,
+        details: JSON.stringify({ oldKeyId: row.id, newKeyId: fresh.id, macro: row.macro }),
+      });
+      return fresh;
+    });
+
+    if (!created) {
+      // Lost the race: re-read to say why.
+      const again = await findKeyRow(db, key);
+      if (again && (again.redeemedBy || again.status === 'redeemed')) {
+        return reply.code(409).send({ error: 'ALREADY_REDEEMED' });
+      }
+      return reply.code(409).send({ error: 'REVOKED' });
+    }
+    return reply.send({ ok: true, key: newKey });
   });
 
   // ── POST /licenses/unban ──────────────────────────────────────────────────
