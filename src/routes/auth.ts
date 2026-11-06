@@ -1,3 +1,4 @@
+import { clearHwidForUser } from '../lib/hwid.js';
 import { fetchDiscordUsername } from '../lib/discord.js';
 import { FastifyInstance, FastifyPluginCallback } from 'fastify';
 import { eq, and, lt, gt, or, sql } from 'drizzle-orm';
@@ -388,40 +389,9 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       return reply.code(404).send({ error: 'No user found with that Discord ID.' });
     }
 
-    // Mirror the legacy Convex clearHwidForBot: null the stored HWID AND set
-    // hwidResetAllowed = true so the user's next sign-in on the new machine
-    // rebinds cleanly (the stored-hwid is null, so the /auth/oauth "no stored
-    // HWID" branch binds the fresh one directly; the reset flag is also
-    // consumed defensively if a stale session tries a redeem first). The
-    // previous version only cleared hwid, so the user had to fully sign out
-    // and back in for the reset to take effect.
-    await db.update(users).set({
-      hwid: null,
-      hwidResetAllowed: true,
-    })
-      .where(eq(users.discordId, discordId));
-
-    // M-11 fix (audit 2026-06-19): invalidate existing desktop sessions for
-    // this user so the OLD machine can't keep using a stale token until it
-    // expires (up to 30 days). The user must re-sign-in on the new machine,
-    // which is the intended flow after an HWID reset.
-    await db.delete(desktopSessions)
-      .where(eq(desktopSessions.discordId, discordId));
-
-    // H-4 fix (audit 2026-06-19): clear the user's trial registrations too,
-    // so an HWID reset can't bypass the one-trial-per-machine lock. Without
-    // this, a user could reset HWID, re-sign-in (new users.hwid), and claim a
-    // 2nd trial because trialRegistrations still held the old HWID.
-    await db.delete(trialRegistrations)
-      .where(eq(trialRegistrations.discordId, discordId));
-
-    // H-2 fix (audit 2026-06-19): audit trail.
-    await db.insert(adminLogs).values({
-      action: 'clear_hwid',
-      actorDiscordId: 'bot',
-      targetDiscordId: discordId,
-      details: JSON.stringify({}),
-    });
+    // Mirror the legacy Convex clearHwidForBot (null hwid, allow rebind, drop sessions
+    // and trial registrations, audit log). Shared with /licenses/reset-hwid-by-key.
+    await clearHwidForUser(db, discordId);
 
     return reply.send({ ok: true });
   });
