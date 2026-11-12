@@ -255,7 +255,10 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
             source: 'redeem',
             duration: storedDuration,
             expiresAt,
-            licenseKeyId: licenseKey.id,
+            // licenseKeyId = the key a refund of which takes this access away.
+            // A timed key on an active lifetime adds nothing, so the lifetime
+            // stays tied to the key that granted it.
+            licenseKeyId: activeLifetime ? existingMacro.licenseKeyId : licenseKey.id,
             updatedAt: now,
           })
           .where(eq(userMacros.id, existingMacro.id));
@@ -364,9 +367,14 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
   });
 
   // ── POST /licenses/ban ────────────────────────────────────────────────────
+  // Turns one key off and takes away the access it granted. The store calls
+  // this with just { key } on a refund or chargeback. Only an explicit
+  // { accountBan: true } (the Discord bot's ban command) also stops the
+  // account from redeeming any other key for this macro.
   app.post('/licenses/ban', { preHandler: adminAuth }, async (request, reply) => {
     const { db } = request.server;
-    const body = request.body as { key?: string };
+    const body = request.body as { key?: string; accountBan?: boolean };
+    const accountBan = body?.accountBan === true;
 
     if (!body?.key) {
       return reply.code(400).send({ error: 'Missing key field' });
@@ -419,17 +427,20 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       // C-1 fix (audit 2026-06-19): add the macro to the user's account-level
       // bannedMacros list so they cannot circumvent the ban by redeeming a
       // fresh key for the same macro. Idempotent — only adds if absent.
-      const [bannedUser] = await db
-        .select({ bannedMacros: users.bannedMacros })
-        .from(users)
-        .where(eq(users.discordId, licenseKey.redeemedBy))
-        .limit(1);
-      const currentBanned = Array.isArray(bannedUser?.bannedMacros) ? bannedUser.bannedMacros : [];
-      if (!currentBanned.includes(licenseKey.macro)) {
-        await db
-          .update(users)
-          .set({ bannedMacros: [...currentBanned, licenseKey.macro], updatedAt: new Date() })
-          .where(eq(users.discordId, licenseKey.redeemedBy));
+      // Only for a real ban: a refunded buyer may buy again.
+      if (accountBan) {
+        const [bannedUser] = await db
+          .select({ bannedMacros: users.bannedMacros })
+          .from(users)
+          .where(eq(users.discordId, licenseKey.redeemedBy))
+          .limit(1);
+        const currentBanned = Array.isArray(bannedUser?.bannedMacros) ? bannedUser.bannedMacros : [];
+        if (!currentBanned.includes(licenseKey.macro)) {
+          await db
+            .update(users)
+            .set({ bannedMacros: [...currentBanned, licenseKey.macro], updatedAt: new Date() })
+            .where(eq(users.discordId, licenseKey.redeemedBy));
+        }
       }
     }
 
@@ -440,7 +451,7 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
       action: 'license_ban',
       actorDiscordId: 'bot',
       targetDiscordId: licenseKey.redeemedBy ?? null,
-      details: JSON.stringify({ key: licenseKey.key, macro: licenseKey.macro }),
+      details: JSON.stringify({ key: licenseKey.key, macro: licenseKey.macro, accountBan }),
     });
 
     return reply.send({ ok: true });
