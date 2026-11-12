@@ -1,12 +1,11 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, and, sql, inArray } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { verifySellAuthSignature, generateLicenseKey } from '../lib/crypto.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
-import { bundleKeyOrderId } from '../lib/grant.js';
+import { bundleKeyOrderId, grantMacro } from '../lib/grant.js';
 import {
   users,
   licenseKeys,
-  userMacros,
   pendingEntitlements,
   migrationClaims,
 } from '../db/schema.js';
@@ -166,36 +165,6 @@ function resolveSkuMapping(
   return null;
 }
 
-function calculateExpiry(duration: string): Date | null {
-  const now = new Date();
-  switch (duration) {
-    case '1m':
-      return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    case '7d':
-      return new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    case 'lifetime':
-      return null;
-    default:
-      return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-  }
-}
-
-// H-1 fix (audit 2026-06-19): duration in milliseconds for the upsert-extend
-// SQL. Mirrors calculateExpiry's cases. Lifetime returns null (handled
-// separately in the upsert set).
-function calculateDurationMs(duration: string): number | null {
-  switch (duration) {
-    case '1m':
-      return 30 * 24 * 60 * 60 * 1000;
-    case '7d':
-      return 7 * 24 * 60 * 60 * 1000;
-    case 'lifetime':
-      return null;
-    default:
-      return 30 * 24 * 60 * 60 * 1000;
-  }
-}
-
 const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
   const db = fastify.db;
 
@@ -326,42 +295,8 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
               .where(inArray(licenseKeys.sellauthOrderId, storedOrderIds(orderId)));
 
             for (const lk of createdKeys) {
-              const expiresAt = calculateExpiry(lk.duration);
-              const lifetime = !expiresAt;
-
-              // H-1 fix (audit 2026-06-19): previously used onConflictDoNothing,
-              // which silently DROPPED the grant for a repeat buyer who already
-              // owned an active macro for the same product — the key was
-              // marked redeemed and the user got nothing. Now we upsert with
-              // an extend: stack the new duration onto the existing expiry (or
-              // start from now if the existing row is revoked/expired), and
-              // upgrade timed → lifetime. Never downgrade lifetime → timed.
-              await tx.insert(userMacros).values({
-                discordId,
-                macro: lk.macro,
-                status: 'active',
-                source: 'sellauth',
-                duration: lk.duration,
-                expiresAt: expiresAt ?? undefined,
-                licenseKeyId: lk.id,
-              }).onConflictDoUpdate({
-                target: [userMacros.discordId, userMacros.macro],
-                set: (ref: any) => ({
-                  status: 'active',
-                  source: 'sellauth',
-                  duration: lk.duration,
-                  expiresAt: lifetime
-                    ? null
-                    : sql`case
-                      when ${ref.expiresAt} is null then ${expiresAt}
-                      when ${ref.status} = 'active' and ${ref.expiresAt} > now() then ${ref.expiresAt} + ${calculateDurationMs(lk.duration)}
-                      else ${expiresAt}
-                    end`,
-                  licenseKeyId: lk.id,
-                  updatedAt: new Date(),
-                }),
-              });
-
+              // Stack onto what they own, same rules as /licenses/redeem.
+              await grantMacro(tx, { discordId, macro: lk.macro, duration: lk.duration, source: 'sellauth', licenseKeyId: lk.id });
               await tx
                 .update(licenseKeys)
                 .set({ status: 'redeemed', redeemedBy: discordId, redeemedAt: new Date() })
@@ -401,7 +336,6 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
       // ── Single product order ───────────────────────────────────────────
       const { macro, duration } = skuResult;
       const key = generateLicenseKey();
-      const expiresAt = calculateExpiry(duration);
 
       await tx.insert(licenseKeys).values({
         key,
@@ -427,35 +361,8 @@ const sellauthPlugin: FastifyPluginCallback = async (fastify) => {
             .limit(1)
             .then((rows: any[]) => rows[0]);
 
-          const lifetime = !expiresAt;
-
-          // H-1 fix (audit 2026-06-19): upsert with extend instead of
-          // onConflictDoNothing (see bundle path above for full rationale).
-          await tx.insert(userMacros).values({
-            discordId,
-            macro,
-            status: 'active',
-            source: 'sellauth',
-            duration,
-            expiresAt: expiresAt ?? undefined,
-            licenseKeyId: createdKey!.id,
-          }).onConflictDoUpdate({
-            target: [userMacros.discordId, userMacros.macro],
-            set: (ref: any) => ({
-              status: 'active',
-              source: 'sellauth',
-              duration,
-              expiresAt: lifetime
-                ? null
-                : sql`case
-                  when ${ref.expiresAt} is null then ${expiresAt}
-                  when ${ref.status} = 'active' and ${ref.expiresAt} > now() then ${ref.expiresAt} + ${calculateDurationMs(duration)}
-                  else ${expiresAt}
-                end`,
-              licenseKeyId: createdKey!.id,
-              updatedAt: new Date(),
-            }),
-          });
+          // Stack onto what they own, same rules as /licenses/redeem.
+          await grantMacro(tx, { discordId, macro, duration, source: 'sellauth', licenseKeyId: createdKey!.id });
 
           await tx
             .update(licenseKeys)
