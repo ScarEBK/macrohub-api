@@ -2,6 +2,7 @@ import { FastifyPluginCallback } from 'fastify';
 import { eq, and, notInArray } from 'drizzle-orm';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { generateLicenseKey, normalizeLicenseKey } from '../lib/crypto.js';
+import { isUniqueViolation } from '../lib/db-errors.js';
 import { licenseKeys, userMacros, adminLogs, users } from '../db/schema.js';
 
 const VALID_MACROS = ['Speed Boost', 'Glitch Roll', 'Strafe'] as const;
@@ -16,11 +17,6 @@ const DURATION_MS: Record<string, number | null> = {
 };
 
 class KeyAlreadyRedeemedError extends Error {}
-
-function isUniqueViolation(err: unknown): boolean {
-  const e = err as { code?: string; cause?: { code?: string } } | null;
-  return e?.code === '23505' || e?.cause?.code === '23505';
-}
 
 const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
   // ── GET /licenses/ping ────────────────────────────────────────────────────
