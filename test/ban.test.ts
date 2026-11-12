@@ -94,4 +94,42 @@ describe('POST /licenses/ban — refund vs account ban', () => {
     expect(row.status).toBe('active');
     expect(row.expiresAt).toBeNull();
   });
+
+  it('19b. refunding one of two lifetime keys keeps the access the other one paid for', async () => {
+    const discordId = 'refund-user-19b';
+    const hwid = 'hwid-refund-19b';
+    await insertUser(db, discordId, hwid);
+    const token = await insertSession(db, discordId, hwid);
+
+    const first = await insertKey(db, { macro: 'Speed Boost', duration: 'lifetime' });
+    expect((await redeem(app, token, hwid, first.key)).statusCode).toBe(200);
+    const second = await insertKey(db, { macro: 'Speed Boost', duration: 'lifetime' });
+    expect((await redeem(app, token, hwid, second.key)).statusCode).toBe(200);
+
+    // Refund the first purchase: the second lifetime still pays for access.
+    expect((await ban(app, { key: first.key })).statusCode).toBe(200);
+    let row = await macroRow(db, discordId, 'Speed Boost');
+    expect(row.status).toBe('active');
+    expect(row.expiresAt).toBeNull();
+
+    // Refund the second one too: now nothing pays for it.
+    expect((await ban(app, { key: second.key })).statusCode).toBe(200);
+    row = await macroRow(db, discordId, 'Speed Boost');
+    expect(row.status).toBe('revoked');
+  });
+
+  it('19c. an account ban revokes even when another lifetime key exists', async () => {
+    const discordId = 'refund-user-19c';
+    const hwid = 'hwid-refund-19c';
+    await insertUser(db, discordId, hwid);
+    const token = await insertSession(db, discordId, hwid);
+
+    const first = await insertKey(db, { macro: 'Strafe', duration: 'lifetime' });
+    expect((await redeem(app, token, hwid, first.key)).statusCode).toBe(200);
+    const second = await insertKey(db, { macro: 'Strafe', duration: 'lifetime' });
+    expect((await redeem(app, token, hwid, second.key)).statusCode).toBe(200);
+
+    expect((await ban(app, { key: first.key, accountBan: true })).statusCode).toBe(200);
+    expect((await macroRow(db, discordId, 'Strafe')).status).toBe('revoked');
+  });
 });

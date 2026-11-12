@@ -1,5 +1,5 @@
 import { FastifyPluginCallback } from 'fastify';
-import { eq, and, notInArray } from 'drizzle-orm';
+import { eq, and, ne, notInArray } from 'drizzle-orm';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { generateLicenseKey, normalizeLicenseKey } from '../lib/crypto.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
@@ -415,9 +415,29 @@ const licenseRoutes: FastifyPluginCallback = (app, _opts, done) => {
     // locked users out of valid lifetime purchases when admins banned a key
     // that had already been superseded.
     if (licenseKey.redeemedBy) {
+      // A refund keeps access that another lifetime key of this user still
+      // pays for (bought twice, or a bundle on top of a single): the access
+      // moves onto that key instead of being revoked. An account ban always revokes.
+      const [stillPaid] = accountBan
+        ? []
+        : await db
+            .select({ id: licenseKeys.id })
+            .from(licenseKeys)
+            .where(and(
+              eq(licenseKeys.redeemedBy, licenseKey.redeemedBy),
+              eq(licenseKeys.macro, licenseKey.macro),
+              eq(licenseKeys.status, 'redeemed'),
+              eq(licenseKeys.duration, 'lifetime'),
+              ne(licenseKeys.id, licenseKey.id),
+            ))
+            .limit(1);
       await db
         .update(userMacros)
-        .set({ status: 'revoked', updatedAt: new Date() })
+        .set(
+          stillPaid
+            ? { licenseKeyId: stillPaid.id, updatedAt: new Date() }
+            : { status: 'revoked', updatedAt: new Date() },
+        )
         .where(and(
           eq(userMacros.discordId, licenseKey.redeemedBy),
           eq(userMacros.macro, licenseKey.macro),
