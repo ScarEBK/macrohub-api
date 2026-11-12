@@ -11,6 +11,7 @@ import { users, desktopSessions, licenseKeys } from '../src/db/schema.js';
 // be set before any test dynamically imports the route plugins.
 process.env.MOTIONCORD_DESKTOP_SECRET ||= 'test-motioncord-secret';
 process.env.ADMIN_SECRET ||= 'test-admin-secret';
+process.env.SELLAUTH_WEBHOOK_SECRET ||= 'test-webhook-secret';
 
 export async function createTestDb() {
   const client = new PGlite();
@@ -44,8 +45,10 @@ export async function buildTestApp() {
 
   const { default: authRoutes } = await import('../src/routes/auth.js');
   const { default: licenseRoutes } = await import('../src/routes/licenses.js');
+  const { default: sellauthRoutes } = await import('../src/routes/sellauth.js');
   await app.register(authRoutes);
   await app.register(licenseRoutes);
+  await app.register(sellauthRoutes);
   await app.ready();
 
   return app;
@@ -95,4 +98,19 @@ export async function insertKey(
     })
     .returning();
   return row;
+}
+
+/** POST a signed store delivery, exactly as SellAuth / motionlifeshop.com send it. */
+export async function deliver(app: any, payload: Record<string, unknown>) {
+  const body = JSON.stringify(payload);
+  const signature = crypto
+    .createHmac('sha256', process.env.SELLAUTH_WEBHOOK_SECRET as string)
+    .update(body)
+    .digest('hex');
+  return app.inject({
+    method: 'POST',
+    url: '/sellauth/webhook',
+    headers: { 'content-type': 'application/json', 'x-signature': signature },
+    payload: body,
+  });
 }

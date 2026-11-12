@@ -6,7 +6,7 @@ import postgres from 'postgres';
 import * as schema from './db/schema.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSchema } from './db/ensure-schema.js';
-import { timingSafeEqual } from './lib/crypto.js';
+import { TRUST_PROXY, rateLimitOptions } from './server-config.js';
 
 import authRoutes from './routes/auth.js';
 import licenseRoutes from './routes/licenses.js';
@@ -50,7 +50,7 @@ const db = drizzle(client, { schema });
 await ensureSchema(dbUrl);
 await runMigrations(dbUrl);
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, trustProxy: TRUST_PROXY });
 
 // ── Raw-body capture for the SellAuth webhook ──────────────────────────────
 // The webhook HMAC signature is computed over the raw request bytes. Fastify's
@@ -102,37 +102,8 @@ await app.register(cors, {
   },
 });
 
-// ── Rate limiting ───────────────────────────────────────────────────────────
-await app.register(rateLimit, {
-  // Raised from 5000 to 20000/min. The Railway proxy pools all client
-  // traffic through a small set of egress IPs, so the IP-keyed bucket is
-  // shared across many users. 5000/min was tight even for legitimate polling
-  // (every desktop checks /licenses/access every 3 min + on events), and once
-  // the B1 fix made the access check actually reach the server, a burst of
-  // simultaneous client updates could trip the limiter and 429 legitimate
-  // redeems. 20000/min gives comfortable headroom while still blocking abuse.
-  max: 20000,
-  timeWindow: '1 minute',
-  keyGenerator: (request) => {
-    // M-7 fix (audit 2026-06-19): previously any non-empty x-admin-secret
-    // header (even a wrong one) yielded a private admin:<ip> bucket, giving
-    // an attacker a dedicated 20k/min bucket separate from the shared IP
-    // pool. Now only verified admin requests get the private bucket —
-    // verify the secret with a timing-safe compare before keying. A wrong
-    // secret falls through to the shared IP bucket (the adminAuth preHandler
-    // will still 401 it downstream).
-    const provided = request.headers['x-admin-secret'];
-    const expected = process.env.ADMIN_SECRET;
-    if (typeof provided === 'string' && typeof expected === 'string' && expected.length > 0) {
-      // Cheap length gate then constant-time compare. Both sides are
-      // app-controlled lengths so the length gate doesn't leak timing.
-      if (provided.length === expected.length && timingSafeEqual(provided, expected)) {
-        return `admin:${request.ip}`;
-      }
-    }
-    return request.ip;
-  },
-});
+// ── Rate limiting (per client; see server-config.ts) ──────────────────────
+await app.register(rateLimit, rateLimitOptions);
 
 // ── Decorate with db ────────────────────────────────────────────────────────
 app.decorate('db', db);

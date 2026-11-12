@@ -13,67 +13,11 @@ import {
 } from '../db/schema.js';
 import { grantInstallReward } from './referrals.js';
 import { verifyOAuthProof, generateSessionToken, timingSafeEqual } from '../lib/crypto.js';
+import { payOutQueuedPurchase } from '../lib/grant.js';
 import { adminAuth, desktopSessionAuth, AuthenticatedRequest } from '../middleware/auth.js';
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const MOTIONCORD_DESKTOP_SECRET = process.env.MOTIONCORD_DESKTOP_SECRET ?? '';
-
-// Duration → milliseconds (lifetime = null expiry). Used by the migration-claim
-// merge to extend timed macros when a returning customer has multiple claims
-// for the same macro (stacking).
-const DURATION_MS_AUTH: Record<string, number | null> = {
-  '1d': 24 * 60 * 60 * 1000,
-  '7d': 7 * 24 * 60 * 60 * 1000,
-  '1m': 30 * 24 * 60 * 60 * 1000,
-  '30d': 30 * 24 * 60 * 60 * 1000,
-  'lifetime': null,
-};
-
-/**
- * Upsert a userMacro with extend-on-conflict semantics (mirrors
- * /licenses/redeem + /migration/import-row). Used by the migration-claim merge
- * so a returning customer with multiple pending claims for the same macro gets
- * them stacked (extended) rather than silently dropped (onConflictDoNothing).
- */
-async function upsertUserMacroExtendAuth(
-  db: any,
-  discordId: string,
-  macro: string,
-  duration: string,
-): Promise<void> {
-  const durationMs = DURATION_MS_AUTH[duration] ?? (30 * 24 * 60 * 60 * 1000);
-  const lifetime = duration === 'lifetime' || durationMs === null;
-
-  const existing = await db.select().from(userMacros)
-    .where(and(eq(userMacros.discordId, discordId), eq(userMacros.macro, macro)))
-    .limit(1).then((rows: any[]) => rows[0] ?? null);
-
-  if (!existing) {
-    await db.insert(userMacros).values({
-      discordId, macro, status: 'active', source: 'migration', duration,
-      expiresAt: lifetime ? undefined : new Date(Date.now() + (durationMs ?? 0)),
-    });
-    return;
-  }
-
-  if (lifetime) {
-    // Upgrade timed → lifetime; never downgrade lifetime.
-    if (existing.expiresAt === null) return;
-    await db.update(userMacros).set({ expiresAt: null, status: 'active', duration: 'lifetime' })
-      .where(eq(userMacros.id, existing.id));
-    return;
-  }
-
-  // Timed: extend existing expiry (don't downgrade a lifetime owner).
-  // If the existing row is revoked, start from now so a reactivated user does
-  // not get leftover revoked time stacked onto the new grant.
-  if (existing.expiresAt === null) return;
-  const now = Date.now();
-  const existingExpires = new Date(existing.expiresAt).getTime();
-  const base = existing.status === 'active' ? Math.max(existingExpires, now) : now;
-  await db.update(userMacros).set({ expiresAt: new Date(base + (durationMs ?? 0)), status: 'active' })
-    .where(eq(userMacros.id, existing.id));
-}
 
 const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) => {
   // ── POST /auth/oauth ────────────────────────────────────────────────────────
@@ -201,13 +145,12 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
         continue;
       }
 
-      // Stack: a repeat buyer of the same macro should have their duration
-      // extended, not silently dropped. The previous version used
-      // onConflictDoNothing which dropped the grant if the user already owned
-      // the macro — inconsistent with /licenses/redeem and the migration-claim
-      // merge, both of which stack via upsertUserMacroExtendAuth.
-      await upsertUserMacroExtendAuth(db, discordId, ent.macro, ent.duration);
-      await db.delete(pendingEntitlements).where(eq(pendingEntitlements.id, ent.id));
+      // Stacks like /licenses/redeem. One purchase = one grant: if the order's
+      // key was already redeemed (or refunded) this pays nothing.
+      await payOutQueuedPurchase(db, discordId, ent, async (tx) =>
+        (await tx.delete(pendingEntitlements)
+          .where(eq(pendingEntitlements.id, ent.id))
+          .returning({ id: pendingEntitlements.id })).length === 1);
     }
 
     // ── 5. Merge migration claims ───────────────────────────────────────────────
@@ -235,11 +178,13 @@ const authPlugin: FastifyPluginCallback = (app: FastifyInstance, _opts, done) =>
       .where(and(claimMatch, eq(migrationClaims.status, 'pending')));
 
     for (const claim of claims) {
-      // Extend-on-conflict: a returning customer with multiple claims for the
-      // same macro gets them stacked (expiry extended), not dropped.
-      await upsertUserMacroExtendAuth(db, discordId, claim.macro, claim.duration);
-      await db.update(migrationClaims).set({ status: 'resolved' })
-        .where(eq(migrationClaims.id, claim.id));
+      // Stacks like /licenses/redeem. One purchase = one grant: if the order's
+      // key was already redeemed (or refunded) this pays nothing.
+      await payOutQueuedPurchase(db, discordId, claim, async (tx) =>
+        (await tx.update(migrationClaims)
+          .set({ status: 'resolved', updatedAt: new Date() })
+          .where(and(eq(migrationClaims.id, claim.id), eq(migrationClaims.status, 'pending')))
+          .returning({ id: migrationClaims.id })).length === 1);
     }
 
     // ── 6. Referral code (new users only) ──────────────────────────────────────
