@@ -2,6 +2,7 @@ import { FastifyPluginCallback } from 'fastify';
 import { eq, and, sql, inArray } from 'drizzle-orm';
 import { verifySellAuthSignature, generateLicenseKey } from '../lib/crypto.js';
 import { isUniqueViolation } from '../lib/db-errors.js';
+import { bundleKeyOrderId } from '../lib/grant.js';
 import {
   users,
   licenseKeys,
@@ -62,11 +63,7 @@ const BUNDLE_MACROS = ['Speed Boost', 'Glitch Roll', 'Strafe'] as const;
 
 // license_keys.sellauth_order_id is unique (one delivery = one set of keys).
 // A single-product key stores the order id as-is; each bundle key stores
-// `${orderId}:${macro}` so all three fit under the unique index.
-function bundleKeyOrderId(orderId: string, macro: string): string {
-  return `${orderId}:${macro}`;
-}
-
+// `${orderId}:${macro}` (bundleKeyOrderId) so all three fit under the index.
 function storedOrderIds(orderId: string): string[] {
   return [orderId, ...BUNDLE_MACROS.map((m) => bundleKeyOrderId(orderId, m))];
 }
